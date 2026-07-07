@@ -1,6 +1,6 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
-    order_book::{Coin, Snapshot, multi_book::OrderBooks, types::InnerOrder},
+    order_book::{Coin, MarketFilter, Px, Side, Snapshot, Sz, multi_book::OrderBooks, types::InnerOrder},
     prelude::*,
     types::{
         inner::InnerLevel,
@@ -10,8 +10,8 @@ use crate::{
 use log::{error, info};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::process::Command;
@@ -26,14 +26,32 @@ pub(super) struct SnapshotConfig {
     pub hlnode_binary: String,
     pub abci_state_path: Option<PathBuf>,
     pub snapshot_output_path: Option<PathBuf>,
-    pub visor_state_path: Option<PathBuf>,
     pub data_dir: PathBuf,
 }
 
-pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf> {
-    info!("Triggering L4 snapshot via hl-node CLI (mode: {:?})...", config.mode);
+struct AbciSnapshotSource {
+    host_path: PathBuf,
+    container_path: String,
+    height: u64,
+}
 
-    let output_path = match config.mode {
+/// Snapshot file plus the exact source height when it is known before parsing.
+///
+/// A raw CLI L4 snapshot has no height in the JSON body. It is only safe when
+/// the source `abci_state` height is proven independently. For normal nodes we
+/// use `data/periodic_abci_states/{date}/{height}.rmp`, whose file name is the
+/// source height. Live visor height is intentionally not accepted: it can be
+/// ahead of the frozen state file and would skip replay events.
+pub(super) struct SnapshotArtifact {
+    pub path: PathBuf,
+    pub exact_source_height: u64,
+}
+
+pub(super) async fn fetch_l4_snapshot(config: &SnapshotConfig) -> Result<SnapshotArtifact> {
+    info!("Triggering L4 snapshot (mode: {:?})...", config.mode);
+
+    let source = resolve_abci_snapshot_source(config)?;
+    let artifact = match config.mode {
         SnapshotMode::Docker => {
             // Docker mode: run command inside container
             // data_dir should be the path containing node_*_by_block directories
@@ -50,7 +68,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                     "Mainnet",
                     "compute-l4-snapshots",
                     "--include-users",
-                    "hl/hyperliquid_data/abci_state.rmp",
+                    &source.container_path,
                     "hl/snapshot.json",
                 ])
                 .output()
@@ -70,21 +88,17 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 }
             }
 
-            output_path
+            SnapshotArtifact { path: output_path, exact_source_height: source.height }
         }
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
-            let abci_path = config.abci_state_path.clone().unwrap_or_else(|| {
-                let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-                parent_dir.join("hyperliquid_data/abci_state.rmp")
-            });
             let output_path =
                 config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
 
             info!(
                 "Running: {} --chain Mainnet compute-l4-snapshots --include-users {} {}",
                 &config.hlnode_binary,
-                abci_path.display(),
+                source.host_path.display(),
                 output_path.display()
             );
 
@@ -94,7 +108,7 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                     "Mainnet",
                     "compute-l4-snapshots",
                     "--include-users",
-                    abci_path.to_str().unwrap_or(""),
+                    source.host_path.to_str().unwrap_or(""),
                     output_path.to_str().unwrap_or(""),
                 ])
                 .output()
@@ -115,20 +129,18 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 }
             }
 
-            output_path
+            SnapshotArtifact { path: output_path, exact_source_height: source.height }
         }
     };
 
     // Verify file exists
-    if output_path.exists() {
-        info!("Snapshot file found at: {:?}", output_path);
-        // Return tuple (output_path, visor_path) - but for now just output_path
-        // The caller needs visor_path too, so we'll store it
-        return Ok(output_path);
+    if artifact.path.exists() {
+        info!("Snapshot file found at: {:?}", artifact.path);
+        return Ok(artifact);
     }
 
     // Debug: List directory contents if file not found
-    if let Some(parent) = output_path.parent() {
+    if let Some(parent) = artifact.path.parent() {
         error!("File not found. Listing directory {:?}:", parent);
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {
@@ -142,25 +154,83 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
     Err("Snapshot file not created".into())
 }
 
+fn resolve_abci_snapshot_source(config: &SnapshotConfig) -> Result<AbciSnapshotSource> {
+    if let Some(path) = &config.abci_state_path {
+        let height = snapshot_height_from_path(path).ok_or_else(|| {
+            format!(
+                "--abci-state-path must point at a height-named state snapshot like \
+                 periodic_abci_states/{{date}}/{{height}}.rmp; {} has no numeric height",
+                path.display()
+            )
+        })?;
+        return Ok(AbciSnapshotSource {
+            host_path: path.clone(),
+            container_path: path.to_string_lossy().into_owned(),
+            height,
+        });
+    }
+
+    latest_periodic_abci_state(&config.data_dir)
+}
+
+fn snapshot_height_from_path(path: &Path) -> Option<u64> {
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
+fn latest_periodic_abci_state(data_dir: &Path) -> Result<AbciSnapshotSource> {
+    let root = data_dir.join("periodic_abci_states");
+    let mut best: Option<(u64, PathBuf)> = None;
+
+    for day in fs::read_dir(&root)
+        .map_err(|err| format!("failed to read periodic abci state dir {}: {err}", root.display()))?
+        .flatten()
+    {
+        let day_path = day.path();
+        if !day_path.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&day_path).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rmp") {
+                continue;
+            }
+            let Some(height) = snapshot_height_from_path(&path) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(best_height, _)| height > *best_height) {
+                best = Some((height, path));
+            }
+        }
+    }
+
+    let Some((height, host_path)) = best else {
+        return Err(format!(
+            "no height-named periodic abci snapshots found under {}; cannot safely label an L4 snapshot",
+            root.display()
+        )
+        .into());
+    };
+    let rel = host_path.strip_prefix(data_dir).unwrap_or(&host_path);
+    let container_path = Path::new("hl").join("data").join(rel).to_string_lossy().into_owned();
+    Ok(AbciSnapshotSource { host_path, container_path, height })
+}
+
+/// Startup backfill floor that is coupled to the snapshot source.
+///
+/// We use the existing height-named periodic state snapshots emitted by the
+/// node. This keeps the snapshot contents and replay floor coupled without
+/// requiring any extra node endpoint or parsing the internal msgpack state.
+pub(super) fn startup_backfill_min_height(config: &SnapshotConfig) -> Result<u64> {
+    Ok(resolve_abci_snapshot_source(config)?.height)
+}
+
 /// Current node height from `visor_abci_state.json`, or None if unreadable.
-/// Used as the startup-backfill floor: the initial snapshot's height is never
-/// below this value (the snapshot is generated after boot and heights only
-/// advance), so every line at or below it is already covered by the snapshot.
-pub(super) fn read_visor_height(visor_path: &std::path::Path) -> Option<u64> {
+/// Kept only for diagnostics/tests; do not use this to label an L4 snapshot.
+#[cfg(test)]
+pub(super) fn read_visor_height(visor_path: &Path) -> Option<u64> {
     let contents = fs::read_to_string(visor_path).ok()?;
     let visor: serde_json::Value = serde_json::from_str(&contents).ok()?;
     visor["height"].as_u64()
-}
-
-/// Get the visor state path based on config
-/// Get the visor state path based on config
-/// data_dir should be the path containing node_*_by_block directories
-/// visor_abci_state.json is in parent/hyperliquid_data/
-pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
-    config.visor_state_path.clone().unwrap_or_else(|| {
-        let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-        parent_dir.join("hyperliquid_data/visor_abci_state.json")
-    })
 }
 
 impl L2SnapshotParams {
@@ -183,8 +253,111 @@ impl L2SnapshotParams {
 /// base is a correct source for every shape. The base is always included so the
 /// raw `(None, None)` consumers (and the chain) stay correct; it is the parent of
 /// every derived shape and only one extra cheap entry.
+fn merge_level(map: &mut BTreeMap<Px, (Sz, usize)>, px: Px, sz: Sz, n: usize) {
+    map.entry(px)
+        .and_modify(|(total_sz, total_n)| {
+            *total_sz = *total_sz + sz;
+            *total_n += n;
+        })
+        .or_insert((sz, n));
+}
+
+fn levels_from_map(map: BTreeMap<Px, (Sz, usize)>, side: Side, cap: Option<usize>) -> Vec<InnerLevel> {
+    let mut levels = Vec::new();
+    if cap == Some(0) {
+        return levels;
+    }
+    match side {
+        Side::Ask => {
+            for (px, (sz, n)) in map {
+                if cap == Some(levels.len()) {
+                    break;
+                }
+                levels.push(InnerLevel { px, sz, n });
+            }
+        }
+        Side::Bid => {
+            for (px, (sz, n)) in map.into_iter().rev() {
+                if cap == Some(levels.len()) {
+                    break;
+                }
+                levels.push(InnerLevel { px, sz, n });
+            }
+        }
+    }
+    levels
+}
+
+fn synthetic_l2_base_for_coin<O: InnerOrder>(
+    order_books: &OrderBooks<O>,
+    coin: &Coin,
+    cap: Option<usize>,
+) -> Snapshot<InnerLevel> {
+    let mut bids = BTreeMap::new();
+    let mut asks = BTreeMap::new();
+
+    if let Some(book) = order_books.as_ref().get(coin) {
+        let raw = book.to_l2_snapshot(cap, None, None);
+        let [raw_bids, raw_asks] = raw.as_ref();
+        for level in raw_bids {
+            merge_level(&mut bids, level.px, level.sz, level.n);
+        }
+        for level in raw_asks {
+            merge_level(&mut asks, level.px, level.sz, level.n);
+        }
+    }
+
+    // HIP-4 public l2Book exposes complete-set liquidity: an order on one side
+    // coin is also executable against the sibling at `1 - px` with the side
+    // flipped. Keep L4/raw streams untouched; synthesize only the L2/BBO view.
+    if let Some(sibling) = coin.hip4_sibling() {
+        if let Some(book) = order_books.as_ref().get(&sibling) {
+            let raw = book.to_l2_snapshot(cap, None, None);
+            let [sibling_bids, sibling_asks] = raw.as_ref();
+            for level in sibling_asks {
+                if let Some(px) = level.px.one_minus() {
+                    merge_level(&mut bids, px, level.sz, level.n);
+                }
+            }
+            for level in sibling_bids {
+                if let Some(px) = level.px.one_minus() {
+                    merge_level(&mut asks, px, level.sz, level.n);
+                }
+            }
+        }
+    }
+
+    Snapshot::new([levels_from_map(bids, Side::Bid, cap), levels_from_map(asks, Side::Ask, cap)])
+}
+
+fn has_synthetic_l2_book<O: InnerOrder>(order_books: &OrderBooks<O>, coin: &Coin) -> bool {
+    order_books.as_ref().contains_key(coin)
+        || coin.hip4_sibling().is_some_and(|sibling| order_books.as_ref().contains_key(&sibling))
+}
+
+fn synthetic_l2_universe<O: InnerOrder>(order_books: &OrderBooks<O>) -> HashSet<Coin> {
+    let mut coins: HashSet<Coin> = order_books.as_ref().keys().cloned().collect();
+    for coin in order_books.as_ref().keys() {
+        if let Some(sibling) = coin.hip4_sibling() {
+            coins.insert(sibling);
+        }
+    }
+    coins
+}
+
+fn expand_with_hip4_siblings(coins: &HashSet<Coin>) -> HashSet<Coin> {
+    let mut expanded = coins.clone();
+    for coin in coins {
+        if let Some(sibling) = coin.hip4_sibling() {
+            expanded.insert(sibling);
+        }
+    }
+    expanded
+}
+
 fn compute_l2_variants_for_coin<O: InnerOrder>(
-    order_book: &crate::order_book::OrderBook<O>,
+    order_books: &OrderBooks<O>,
+    coin: &Coin,
     active: &HashSet<L2SnapshotParams>,
 ) -> HashMap<L2SnapshotParams, Snapshot<InnerLevel>> {
     use crate::types::subscription::MAX_LEVELS;
@@ -196,7 +369,7 @@ fn compute_l2_variants_for_coin<O: InnerOrder>(
 
     // Raw base: capped, full-information, the parent of every derived shape.
     let base_params = L2SnapshotParams { n_sig_figs: None, mantissa: None };
-    let base = order_book.to_l2_snapshot(cap, None, None);
+    let base = synthetic_l2_base_for_coin(order_books, coin, cap);
 
     for params in active {
         if *params == base_params {
@@ -233,18 +406,21 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     /// rayon's task-dispatch overhead exceeds the rebuild work itself.
     const PAR_COMPUTE_THRESHOLD: usize = 8;
 
+    let synthetic_universe = synthetic_l2_universe(order_books);
+    let expanded_changed_coins = expand_with_hip4_siblings(changed_coins);
+
     // Evict stale entries.
     let len_before_evict = cache.len();
-    cache.retain(|coin, _| order_books.as_ref().contains_key(coin));
+    cache.retain(|coin, _| synthetic_universe.contains(coin));
     let mut coin_set_changed = cache.len() != len_before_evict;
 
     // Determine which coins we actually need to (re)compute: anything in
     // `changed_coins` that the book still contains, plus any present-but-uncached
     // coins (first-time broadcast after a snapshot reset).
     let mut to_compute: Vec<Coin> =
-        changed_coins.iter().filter(|c| order_books.as_ref().contains_key(*c)).cloned().collect();
-    for coin in order_books.as_ref().keys() {
-        if !cache.contains_key(coin) && !changed_coins.contains(coin) {
+        expanded_changed_coins.iter().filter(|c| has_synthetic_l2_book(order_books, c)).cloned().collect();
+    for coin in &synthetic_universe {
+        if !cache.contains_key(coin) && !expanded_changed_coins.contains(coin) {
             to_compute.push(coin.clone());
         }
     }
@@ -253,7 +429,10 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     // Recompute the coins we need, building only the subscribed shapes; fan
     // out to rayon only for genuinely large rebuilds (post-snapshot recompute).
     let build = |coin: Coin| {
-        order_books.as_ref().get(&coin).map(|book| (coin, Arc::new(compute_l2_variants_for_coin(book, active))))
+        has_synthetic_l2_book(order_books, &coin).then(|| {
+            let variants = compute_l2_variants_for_coin(order_books, &coin, active);
+            (coin, Arc::new(variants))
+        })
     };
     let updates: Vec<(Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>)> =
         if to_compute.len() < PAR_COMPUTE_THRESHOLD {
@@ -269,8 +448,8 @@ pub(super) fn compute_l2_snapshots_incremental<O: InnerOrder + Send + Sync>(
     // A dirty coin whose book is GONE (last order cancelled -> multi-book
     // evicted it) still counts as recomputed: connections must be told the
     // book is now empty, or they keep the last snapshot forever.
-    for coin in changed_coins {
-        if !order_books.as_ref().contains_key(coin) {
+    for coin in &expanded_changed_coins {
+        if !synthetic_universe.contains(coin) {
             recomputed.insert(coin.clone());
         }
     }
@@ -289,15 +468,35 @@ pub(super) enum EventBatch {
     Fills(Batch<NodeDataFill>),
 }
 
+impl EventBatch {
+    pub(super) fn filter_market(self, market_filter: MarketFilter) -> Option<Self> {
+        let batch = match self {
+            Self::Orders(batch) => {
+                Self::Orders(batch.filter_events(|status| market_filter.matches(&Coin::new(&status.order.coin))))
+            }
+            Self::BookDiffs(batch) => Self::BookDiffs(batch.filter_events(|diff| market_filter.matches(&diff.coin()))),
+            Self::Fills(batch) => {
+                Self::Fills(batch.filter_events(|fill| market_filter.matches(&Coin::new(&fill.1.coin))))
+            }
+        };
+        let events_len = match &batch {
+            Self::Orders(batch) => batch.events_len(),
+            Self::BookDiffs(batch) => batch.events_len(),
+            Self::Fills(batch) => batch.events_len(),
+        };
+        (events_len > 0).then_some(batch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        order_book::{Px, Side, Sz, multi_book::Snapshots, types::InnerOrder},
+        order_book::{Px, Side, Sz, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
     use alloy::primitives::Address;
-    use std::collections::HashSet;
+    use std::{collections::HashSet, path::PathBuf};
 
     fn order(oid: u64, coin: &str, side: Side, sz: &str, px: &str) -> InnerL4Order {
         InnerL4Order {
@@ -351,6 +550,58 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    fn snapshot_config(mode: SnapshotMode, abci_state_path: Option<PathBuf>) -> SnapshotConfig {
+        SnapshotConfig {
+            mode,
+            docker_container: "hyperliquid_hlnode".to_string(),
+            hlnode_binary: "hl-node".to_string(),
+            abci_state_path,
+            snapshot_output_path: None,
+            data_dir: PathBuf::from("/var/lib/hl/data"),
+        }
+    }
+
+    #[test]
+    fn test_startup_backfill_floor_uses_periodic_abci_height() {
+        let config = snapshot_config(
+            SnapshotMode::Direct,
+            Some(PathBuf::from("/var/lib/hl/data/periodic_abci_states/20260707/123450000.rmp")),
+        );
+        assert_eq!(startup_backfill_min_height(&config).unwrap(), 123_450_000);
+    }
+
+    #[test]
+    fn test_startup_backfill_rejects_explicit_live_abci_without_height() {
+        let config =
+            snapshot_config(SnapshotMode::Direct, Some(PathBuf::from("/var/lib/hl/hyperliquid_data/abci_state.rmp")));
+        let err = startup_backfill_min_height(&config).unwrap_err().to_string();
+        assert!(err.contains("must point at a height-named state snapshot"), "{err}");
+    }
+
+    #[test]
+    fn test_startup_backfill_floor_auto_discovers_latest_periodic_snapshot() {
+        let dir = std::env::temp_dir().join(format!("obs_periodic_abci_test_{}", std::process::id()));
+        let day1 = dir.join("periodic_abci_states/20260706");
+        let day2 = dir.join("periodic_abci_states/20260707");
+        fs::create_dir_all(&day1).unwrap();
+        fs::create_dir_all(&day2).unwrap();
+        fs::write(day1.join("123.rmp"), b"").unwrap();
+        fs::write(day2.join("122.rmp"), b"").unwrap();
+        fs::write(day2.join("456.rmp"), b"").unwrap();
+        fs::write(day2.join("not-a-height.rmp"), b"").unwrap();
+
+        let config = SnapshotConfig {
+            mode: SnapshotMode::Direct,
+            docker_container: "hyperliquid_hlnode".to_string(),
+            hlnode_binary: "hl-node".to_string(),
+            abci_state_path: None,
+            snapshot_output_path: None,
+            data_dir: dir.clone(),
+        };
+        assert_eq!(startup_backfill_min_height(&config).unwrap(), 456);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_l2_variants_are_capped_to_max_levels() {
         use crate::types::subscription::MAX_LEVELS;
@@ -363,8 +614,8 @@ mod tests {
             books.add_order(order((1_000_000 + i) as u64, "BTC", Side::Ask, "1", &ask_px));
         }
 
-        let book = books.as_ref().get(&Coin::new("BTC")).unwrap();
-        let variants = compute_l2_variants_for_coin(book, &all_params());
+        let coin = Coin::new("BTC");
+        let variants = compute_l2_variants_for_coin(&books, &coin, &all_params());
         let base = variants.get(&L2SnapshotParams::new(None, None)).unwrap();
         let [bids, asks] = base.as_ref();
         assert!(bids.len() <= MAX_LEVELS, "base bids capped: {} <= {}", bids.len(), MAX_LEVELS);
@@ -384,7 +635,7 @@ mod tests {
 
         let mut cache = HashMap::new();
         // First call seeds the cache for both coins.
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache));
         assert_eq!(cache.len(), 2);
         let btc_first = Arc::clone(cache.get(&Coin::new("BTC")).unwrap());
         let eth_first = Arc::clone(cache.get(&Coin::new("ETH")).unwrap());
@@ -392,7 +643,7 @@ mod tests {
         // Mark BTC changed; ETH unchanged. ETH's Arc must be the same object.
         let changed: HashSet<Coin> = std::iter::once(Coin::new("BTC")).collect();
         books.add_order(order(3, "BTC", Side::Bid, "2", "50001"));
-        let _ = compute_l2_snapshots_incremental(&books, &changed, &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &changed, &all_params(), &mut cache));
 
         let btc_after = cache.get(&Coin::new("BTC")).unwrap();
         let eth_after = cache.get(&Coin::new("ETH")).unwrap();
@@ -412,7 +663,7 @@ mod tests {
 
         let mut cache = HashMap::new();
         // Seed both coins.
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache));
         let a_seed = Arc::clone(cache.get(&Coin::new("A")).unwrap());
         let b_seed = Arc::clone(cache.get(&Coin::new("B")).unwrap());
 
@@ -422,7 +673,7 @@ mod tests {
         books.add_order(order(4, "B", Side::Bid, "5", "201"));
 
         let dirty: HashSet<Coin> = ["A", "B"].iter().map(|c| Coin::new(c)).collect();
-        let _ = compute_l2_snapshots_incremental(&books, &dirty, &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &dirty, &all_params(), &mut cache));
 
         assert!(
             !Arc::ptr_eq(&a_seed, cache.get(&Coin::new("A")).unwrap()),
@@ -432,6 +683,24 @@ mod tests {
             !Arc::ptr_eq(&b_seed, cache.get(&Coin::new("B")).unwrap()),
             "B changed in the triggering event and must be rebuilt"
         );
+    }
+
+    #[test]
+    fn test_hip4_l2_merges_complementary_sibling_liquidity() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        books.add_order(order(1, "#7510", Side::Bid, "10", "0.8"));
+        books.add_order(order(2, "#7510", Side::Ask, "2", "0.9"));
+        books.add_order(order(3, "#7511", Side::Bid, "3", "0.1")); // mirrored as #7510 ask 0.9
+        books.add_order(order(4, "#7511", Side::Ask, "4", "0.3")); // mirrored as #7510 bid 0.7
+
+        let variants = compute_l2_variants_for_coin(&books, &Coin::new("#7510"), &all_params());
+        let base = variants.get(&L2SnapshotParams::new(None, None)).unwrap();
+        let [bids, asks] = base.as_ref();
+        let bid_levels: Vec<_> = bids.iter().map(|l| (l.px.to_str(), l.sz.to_str(), l.n)).collect();
+        let ask_levels: Vec<_> = asks.iter().map(|l| (l.px.to_str(), l.sz.to_str(), l.n)).collect();
+
+        assert_eq!(bid_levels, vec![("0.8".to_string(), "10".to_string(), 1), ("0.7".to_string(), "4".to_string(), 1)]);
+        assert_eq!(ask_levels, vec![("0.9".to_string(), "5".to_string(), 2)]);
     }
 
     #[test]
@@ -445,13 +714,13 @@ mod tests {
         books.add_order(order(2, "B", Side::Bid, "1", "200"));
 
         let mut cache = HashMap::new();
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache));
         let a_seed = Arc::clone(cache.get(&Coin::new("A")).unwrap());
 
         // A's book changes, but only B is passed as changed (A's change was dropped).
         books.add_order(order(3, "A", Side::Bid, "5", "101"));
         let only_b: HashSet<Coin> = std::iter::once(Coin::new("B")).collect();
-        let _ = compute_l2_snapshots_incremental(&books, &only_b, &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &only_b, &all_params(), &mut cache));
 
         assert!(
             Arc::ptr_eq(&a_seed, cache.get(&Coin::new("A")).unwrap()),
@@ -466,7 +735,8 @@ mod tests {
         books.add_order(order(2, "ETH", Side::Bid, "1", "3000"));
 
         let mut cache = HashMap::new();
-        let (_, recomputed, changed) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        let (_, recomputed, changed) =
+            compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
         assert!(changed, "first build introduces coins to the cache");
         assert!(recomputed.contains("BTC") && recomputed.contains("ETH"));
 
@@ -479,7 +749,8 @@ mod tests {
 
         // Evicting a coin flags a coin-set change (universe must be rebuilt).
         books.cancel_order(crate::order_book::Oid::new(1), Coin::new("BTC"));
-        let (_, recomputed, changed) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        let (_, recomputed, changed) =
+            compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
         assert!(changed, "eviction must flag a universe change");
         assert!(recomputed.is_empty());
     }
@@ -492,7 +763,7 @@ mod tests {
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
         books.add_order(order(1, "BTC", Side::Bid, "1", "50000"));
         let mut cache = HashMap::new();
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache));
 
         books.cancel_order(crate::order_book::Oid::new(1), Coin::new("BTC")); // book evicted
         let dirty: HashSet<Coin> = std::iter::once(Coin::new("BTC")).collect();
@@ -508,13 +779,13 @@ mod tests {
         books.add_order(order(2, "ETH", Side::Bid, "1", "3000"));
 
         let mut cache = HashMap::new();
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache));
         assert!(cache.contains_key(&Coin::new("BTC")));
 
         // Cancel BTC's only order — the multi-book evicts the empty book, which
         // means our cache must also drop the entry on the next incremental call.
         books.cancel_order(crate::order_book::Oid::new(1), Coin::new("BTC"));
-        let _ = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        drop(compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache));
         assert!(!cache.contains_key(&Coin::new("BTC")), "BTC entry should have been evicted from the cache");
         assert!(cache.contains_key(&Coin::new("ETH")));
     }
@@ -523,11 +794,10 @@ mod tests {
     fn test_compute_only_builds_requested_variants() {
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
         books.add_order(order(1, "BTC", Side::Bid, "1", "50000"));
-        let book = books.as_ref().get(&Coin::new("BTC")).unwrap();
 
         let mut active = HashSet::new();
         active.insert(L2SnapshotParams::new(Some(5), None));
-        let variants = compute_l2_variants_for_coin(book, &active);
+        let variants = compute_l2_variants_for_coin(&books, &Coin::new("BTC"), &active);
 
         // The requested shape plus the always-present raw base; nothing else.
         assert!(variants.contains_key(&L2SnapshotParams::new(Some(5), None)), "requested variant built");
@@ -541,9 +811,7 @@ mod tests {
     fn test_compute_empty_active_builds_nothing() {
         let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
         books.add_order(order(1, "BTC", Side::Bid, "1", "50000"));
-        let book = books.as_ref().get(&Coin::new("BTC")).unwrap();
-
-        let variants = compute_l2_variants_for_coin(book, &HashSet::new());
+        let variants = compute_l2_variants_for_coin(&books, &Coin::new("BTC"), &HashSet::new());
         assert!(variants.is_empty(), "empty active set computes no variants");
     }
 
@@ -556,13 +824,11 @@ mod tests {
             books.add_order(order(i, "BTC", Side::Bid, "1", &format!("{}", 50000 - i)));
             books.add_order(order(1000 + i, "BTC", Side::Ask, "1", &format!("{}", 50100 + i)));
         }
-        let book = books.as_ref().get(&Coin::new("BTC")).unwrap();
-
-        let full = compute_l2_variants_for_coin(book, &all_params());
+        let full = compute_l2_variants_for_coin(&books, &Coin::new("BTC"), &all_params());
         for shape in all_params() {
             let mut one = HashSet::new();
             one.insert(shape);
-            let single = compute_l2_variants_for_coin(book, &one);
+            let single = compute_l2_variants_for_coin(&books, &Coin::new("BTC"), &one);
             // InnerLevel has no PartialEq; compare via Debug rendering of the levels.
             assert_eq!(
                 format!("{:?}", single.get(&shape).map(Snapshot::as_ref)),

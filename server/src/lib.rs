@@ -38,17 +38,19 @@ pub struct ServerConfig {
     pub include_spot: bool,
     /// Include HIP-3 markets
     pub include_hip3: bool,
+    /// Include HIP-4 Outcome markets (# coins)
+    pub include_hip4: bool,
     /// Snapshot fetching mode (docker or direct)
     pub snapshot_mode: SnapshotMode,
     /// Docker container name for exec commands (docker mode only)
     pub docker_container: String,
     /// Path to hl-node binary (direct mode only)
     pub hlnode_binary: String,
-    /// Path to abci_state.rmp file (direct mode only, has default)
+    /// Explicit height-named periodic ABCI snapshot path
     pub abci_state_path: Option<PathBuf>,
     /// Path where snapshot will be written (direct mode only, has default)
     pub snapshot_output_path: Option<PathBuf>,
-    /// Path to visor_abci_state.json (optional)
+    /// Deprecated/diagnostic only; snapshot height is not read from visor
     pub visor_state_path: Option<PathBuf>,
     /// Port for Prometheus metrics endpoint (0 to disable)
     pub metrics_port: u16,

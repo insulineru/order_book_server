@@ -7,7 +7,7 @@ use crate::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
         MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_CONNECTIONS_ACTIVE, WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
-    order_book::{Coin, Snapshot},
+    order_book::{Coin, MarketFilter, Snapshot},
     prelude::*,
     types::{
         Bbo, L2Book, L4Book, L4BookUpdates, L4Order,
@@ -68,13 +68,7 @@ struct BboEntry {
 /// `nLevels == DEFAULT_LEVELS`, so `unwrap_or(DEFAULT_LEVELS)` cannot collide
 /// with an explicit value.
 fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>, n_levels: Option<usize>) -> String {
-    format!(
-        "{}:{}:{}:{}",
-        coin,
-        n_sig_figs.unwrap_or(0),
-        mantissa.unwrap_or(0),
-        n_levels.unwrap_or(DEFAULT_LEVELS)
-    )
+    format!("{}:{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0), n_levels.unwrap_or(DEFAULT_LEVELS))
 }
 
 /// Build a tokio interval that fires often enough to drive both heartbeats with
@@ -114,7 +108,8 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
 
     // Market filter flags from config
-    let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
+    let market_filter =
+        MarketFilter::new(config.include_perps, config.include_spot, config.include_hip3, config.include_hip4);
     let ignore_spot = !config.include_spot; // For OrderBookListener (legacy)
     let compression_level = config.compression_level;
 
@@ -565,9 +560,13 @@ async fn receive_client_message(
     // operator sees a single clear "denied" message in the log instead of "valid
     // subscription" then a rejection.
     if bbo_only && !matches!(&subscription, Subscription::Bbo { .. }) {
-        return send_socket_message(socket, ServerResponse::Error(
-            "BBO-only mode: L2/L4/Trades subscriptions disabled. Only BBO subscriptions allowed.".to_string(),
-        )).await;
+        return send_socket_message(
+            socket,
+            ServerResponse::Error(
+                "BBO-only mode: L2/L4/Trades subscriptions disabled. Only BBO subscriptions allowed.".to_string(),
+            ),
+        )
+        .await;
     }
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
@@ -581,16 +580,15 @@ async fn receive_client_message(
                 // Register the variant shape so the listener computes it. One guard
                 // per shape per connection (n_levels is a send-time truncation, not
                 // part of the cached shape); the entry API dedups shared shapes.
-                if inserted
-                    && let Subscription::L2Book { n_sig_figs, mantissa, .. } = &subscription
-                {
+                if inserted && let Subscription::L2Book { n_sig_figs, mantissa, .. } = &subscription {
                     let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
                     l2_param_guards.entry(params).or_insert_with(|| active_l2_params.acquire(params));
                 }
                 ("", inserted)
             }
             Err(err) => {
-                return send_socket_message(socket, ServerResponse::Error(format!("Rejected subscription: {err}"))).await;
+                return send_socket_message(socket, ServerResponse::Error(format!("Rejected subscription: {err}")))
+                    .await;
             }
         },
         ClientMessage::Unsubscribe { .. } => {
@@ -631,8 +629,11 @@ async fn receive_client_message(
                 Ok(msg) => msg,
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
-                    return send_socket_message(socket,
-                        ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"))).await;
+                    return send_socket_message(
+                        socket,
+                        ServerResponse::Error(format!("Unable to grab order book snapshot: {err}")),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -676,10 +677,12 @@ async fn send_ws_data_from_bbo(
             // per coin per broadcast (plus once per heartbeat-enabled
             // connection for the resend payload) instead of per connection.
             let render = || {
-                let bid =
-                    best_bid.as_ref().map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
-                let ask =
-                    best_ask.as_ref().map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
+                let bid = best_bid
+                    .as_ref()
+                    .map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
+                let ask = best_ask
+                    .as_ref()
+                    .map(|(px, sz, n)| crate::types::Level::new(px.to_str(), sz.to_str(), *n as usize));
                 Bbo { coin: coin.to_string(), time, bid, ask }
             };
 
@@ -845,12 +848,7 @@ impl Subscription {
             if let Some((time, height, coin_snapshot)) = snapshot {
                 let levels =
                     coin_snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-                return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
-                    coin: coin.clone(),
-                    time,
-                    height,
-                    levels,
-                })));
+                return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot { coin: coin.clone(), time, height, levels })));
             }
             return Err("Snapshot Failed".into());
         }

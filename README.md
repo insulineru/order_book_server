@@ -26,12 +26,13 @@ Real-time orderbook data from a local Hyperliquid node:
 
 ### System Requirements
 
-The server runs co-located with a Hyperliquid node and is memory-light relative to the node itself. Figures below are measured in production with ~630 coins (all markets: perps + spot + HIP-3) and ~440 k live orders.
+The server runs co-located with a Hyperliquid node and is memory-light relative to the node itself. Figures below are measured in production with ~630 coins (all markets: perps + spot + HIP-3 + HIP-4) and ~440 k live orders.
 
 | Profile | CPU | RAM (steady-state) | Notes |
 |---------|-----|---------------------|-------|
 | **Full (`--markets all`)** | 2 cores minimum, 4+ recommended | ~750 MB – 2 GB | Rises with connected clients and L2 subscription fanout. Reserve **4 GB** for headroom in production. |
 | **Perps only (`--markets perps`)** | 2 cores | ~400 MB – 1 GB | Smaller universe ≈ smaller book and fewer L2 variants to compute. |
+| **HIP-4 only (`--markets hip4`)** | 1-2 cores | depends on active outcome universe | Filters snapshots, replay/backfill caches, live diffs/statuses/fills, and subscription validation to `#` Outcome coins only. |
 | **BBO-only (`--bbo-only`)** | 1 core | ~100 – 150 MB | Top-of-book only, no L2/L4/trades. |
 
 Other requirements:
@@ -40,7 +41,7 @@ Other requirements:
 - **Architecture:** x86_64 or aarch64.
 - **File descriptors:** raise `LimitNOFILE` in your service unit (the included one sets `1048576`). Each WebSocket client uses one fd.
 - **Disk:** negligible for the server itself (~10 MB binary). The Hyperliquid node's `*_streaming/` directories grow with traffic — size them per the node's documentation, not this server's.
-- **Network:** outbound bandwidth scales with `(connected clients) × (subscription mix)`. L2 snapshots with many `(coin, n_sig_figs, mantissa)` variants are the largest payloads — use `--compression-level 1` and/or `--markets perps` to bound it.
+- **Network:** outbound bandwidth scales with `(connected clients) × (subscription mix)`. L2 snapshots with many `(coin, n_sig_figs, mantissa)` variants are the largest payloads — use `--compression-level 1`, `--markets perps`, or `--markets hip4` to bound it.
 
 **Sizing rule of thumb.** Memory grows roughly with (a) the universe of coins the node serves, and (b) the number of distinct L2 subscription tuples your clients open. The 256-per-connection subscription cap and the broadcast channel capacity bound the worst case. If you see `channel_drops_total` rising or `broadcast_channel_lag` non-zero, you have a slow consumer — not a server-side leak.
 
@@ -125,7 +126,7 @@ The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
 After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify.
 
-The handoff from snapshot to live stream is **gapless**: at startup the server backfills the streaming files from the node's last persisted height, and every event that arrives while the snapshot is being generated is cached and replayed on top of it (filtered by block height, so nothing is double-applied). If the server ever detects that events were provably lost (a corrupt line, an oversized batch, watcher data loss), it marks the book out-of-sync and automatically re-fetches a snapshot in the background while continuing to serve — see `orderbook_desyncs_total` in the metrics.
+The handoff from snapshot to live stream is **gapless**: at startup the server backfills the streaming files from the exact periodic ABCI snapshot height used to build the L4 book, and every event that arrives while the snapshot is being generated is cached and replayed on top of it (filtered by block height, so nothing is double-applied). If the server ever detects that events were provably lost (a corrupt line, an oversized batch, watcher data loss), it marks the book out-of-sync and automatically re-fetches a snapshot in the background while continuing to serve — see `orderbook_desyncs_total` in the metrics.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -133,9 +134,9 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
-| `--abci-state-path` | auto | Path to `abci_state.rmp`. Auto-detected at `<data-dir>/../hyperliquid_data/abci_state.rmp` in direct mode (a sibling of `--data-dir`, alongside `visor_abci_state.json`). Override if your node stores state in a non-standard location |
+| `--abci-state-path` | latest periodic | Optional explicit path to a height-named periodic ABCI snapshot, e.g. `<data-dir>/periodic_abci_states/20260707/123450000.rmp`. By default the server picks the highest numeric `.rmp` under `<data-dir>/periodic_abci_states/*/`. Live `abci_state.rmp` paths are rejected because their contents can lag the live visor height |
 | `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json`. Override if `/tmp` is not writable or you want snapshots stored elsewhere |
-| `--visor-state-path` | auto | Path to `visor_abci_state.json`, which contains the current block height. Auto-detected at `<data-dir>/../hyperliquid_data/visor_abci_state.json` (the *parent* of `--data-dir`, since `hyperliquid_data/` is a sibling of the `data/` event dir). Override if your visor state is in a non-standard location |
+| `--visor-state-path` | unused | Kept for compatibility/diagnostics. Snapshot height is not read from live `visor_abci_state.json`; it is derived from the periodic snapshot filename |
 
 ### Market Types
 
@@ -144,6 +145,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `perps` | Perpetual futures only (BTC, ETH, SOL...) |
 | `spot` | Spot markets (`@*` coins, PURR/USDC) |
 | `hip3` | HIP-3 markets (X:Y format, e.g., xyz:TSLA) |
+| `hip4` | HIP-4 Outcome markets (`#*` coins) |
 | `all` | All markets (default) |
 
 ### Advanced Options
@@ -351,7 +353,7 @@ The in-memory book is kept consistent with the node through three layers:
 
 1. **Startup backfill** - at boot, the watchers read the streaming files from the node's last persisted height (not from end-of-file), so data written before the server started is not skipped.
 2. **Snapshot replay** - every book-affecting event that arrives while a snapshot is being generated is cached and replayed above the snapshot height, making the snapshot-to-stream handoff gapless.
-3. **Desync self-healing** - any provable event loss (parse/apply error on a batch, oversized batch, watcher buffer discard, pending-cache eviction) marks the book out-of-sync and triggers an automatic background snapshot re-fetch. The book keeps serving its current state until the fresh snapshot lands. Each loss is recorded with a block-height bound, and the out-of-sync flag only clears once a snapshot's height actually covers that bound - a snapshot generated from lagging node state cannot mask a newer loss. Each occurrence is counted in `orderbook_desyncs_total{reason}`. The status/diff pairing caches are evicted by age (60 s): expected orphans are dropped silently, while an unpaired diff aging out counts as data loss and re-syncs the book.
+3. **Desync self-healing** - any provable event loss (parse/apply error on a batch, oversized batch, watcher buffer discard, pending-cache eviction, unknown update/remove diff, or crossed in-memory book) marks the book out-of-sync and triggers an automatic background snapshot re-fetch. The book keeps serving its current state until the fresh snapshot lands. Each loss is recorded with a block-height bound, and the out-of-sync flag only clears once a snapshot's height actually covers that bound - a snapshot generated from lagging node state cannot mask a newer loss. Each occurrence is counted in `orderbook_desyncs_total{reason}`. The status/diff pairing caches are evicted by age (60 s): expected orphans are dropped silently, while an unpaired diff aging out counts as data loss and re-syncs the book.
 4. **Watcher watchdog** - if a file watcher thread dies (or every watcher channel closes), the server exits so the process supervisor restarts it into a clean re-sync, instead of serving a silently frozen book that still reports `ready`. A watcher that is alive but has produced no events for 2 minutes is loud-logged (restarting would not fix a stalled node).
 
 ### Deduplication
@@ -582,11 +584,11 @@ This fork calls `hl-node compute-l4-snapshots` directly, with two modes:
 - **Docker**: `docker exec <container> hl-node ...` for container-based setups
 - **Direct**: calls the binary on the host for systemctl / bare metal deployments
 
-All paths (`abci_state.rmp`, `snapshot.json`, `visor_abci_state.json`) are auto-detected with manual override options.
+The ABCI input is auto-detected from height-named periodic snapshots under `data/periodic_abci_states/{date}/{height}.rmp`; the same height labels the snapshot and drives startup backfill. This avoids labeling frozen snapshot contents with a newer live visor height.
 
 ### Market Filtering
 
-The original has a hard-coded `ignore_spot` flag. This fork adds a `--markets` CLI flag supporting `perps`, `spot`, `hip3` (HIP-3 tokens in X:Y format), or `all`.
+The original has a hard-coded `ignore_spot` flag. This fork adds a `--markets` CLI flag supporting `perps`, `spot`, `hip3` (HIP-3 tokens in X:Y format), `hip4` (Outcome markets, `#*`), or `all`.
 
 ### Prometheus Metrics & Health Endpoint
 

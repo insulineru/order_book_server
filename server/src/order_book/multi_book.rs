@@ -1,8 +1,8 @@
 use crate::{
-    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Snapshot, Sz},
+    order_book::{Coin, InnerOrder, Oid, OrderBook, Px, Side, Snapshot, Sz},
     prelude::*,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -11,9 +11,41 @@ use tokio::fs::read_to_string;
 
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
+type Bbo = (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>);
+
+fn merge_best(best: &mut Option<(Px, Sz, u32)>, candidate: Option<(Px, Sz, u32)>, side: Side) {
+    let Some(candidate) = candidate else { return };
+    match best {
+        None => *best = Some(candidate),
+        Some(current) if current.0 == candidate.0 => {
+            current.1 = current.1 + candidate.1;
+            current.2 = current.2.saturating_add(candidate.2);
+        }
+        Some(current) => {
+            let replace = match side {
+                Side::Bid => candidate.0 > current.0,
+                Side::Ask => candidate.0 < current.0,
+            };
+            if replace {
+                *current = candidate;
+            }
+        }
+    }
+}
+
+fn mirror_bbo((bid, ask): Bbo) -> Bbo {
+    let mirrored_bid = ask.and_then(|(px, sz, n)| px.one_minus().map(|px| (px, sz, n)));
+    let mirrored_ask = bid.and_then(|(px, sz, n)| px.one_minus().map(|px| (px, sz, n)));
+    (mirrored_bid, mirrored_ask)
+}
+
 impl<O> Snapshots<O> {
     pub(crate) const fn new(value: HashMap<Coin, Snapshot<O>>) -> Self {
         Self(value)
+    }
+
+    pub(crate) fn retain_coins(&mut self, mut keep: impl FnMut(&Coin) -> bool) {
+        self.0.retain(|coin, _| keep(coin));
     }
 
     pub(crate) fn value(self) -> HashMap<Coin, Snapshot<O>> {
@@ -34,6 +66,10 @@ impl<O: InnerOrder> OrderBooks<O> {
     /// Total number of orders across all orderbooks
     pub(crate) fn order_count(&self) -> usize {
         self.order_books.values().map(|book| book.order_count()).sum()
+    }
+
+    pub(crate) fn first_crossed_coin(&self) -> Option<Coin> {
+        self.order_books.iter().find_map(|(coin, book)| book.is_crossed().then(|| coin.clone()))
     }
     #[must_use]
     pub(crate) fn from_snapshots(snapshot: Snapshots<O>, ignore_triggers: bool) -> Self {
@@ -93,11 +129,18 @@ impl<O: InnerOrder> OrderBooks<O> {
     pub(crate) fn get_bbos_for_coins(
         &self,
         coins: &std::collections::HashSet<Coin>,
-    ) -> HashMap<Coin, (Option<(Px, Sz, u32)>, Option<(Px, Sz, u32)>)> {
-        coins
-            .iter()
-            .map(|coin| (coin.clone(), self.order_books.get(coin).map_or((None, None), OrderBook::get_bbo)))
-            .collect()
+    ) -> HashMap<Coin, Bbo> {
+        coins.iter().map(|coin| (coin.clone(), self.synthetic_bbo_for_coin(coin))).collect()
+    }
+
+    fn synthetic_bbo_for_coin(&self, coin: &Coin) -> Bbo {
+        let (mut bid, mut ask) = self.order_books.get(coin).map_or((None, None), OrderBook::get_bbo);
+        if let Some(sibling) = coin.hip4_sibling() {
+            let mirrored = self.order_books.get(&sibling).map_or((None, None), |book| mirror_bbo(book.get_bbo()));
+            merge_best(&mut bid, mirrored.0, Side::Bid);
+            merge_best(&mut ask, mirrored.1, Side::Ask);
+        }
+        (bid, ask)
     }
 
     /// Compact slab allocators across every coin's orderbook. Returns the number
@@ -137,15 +180,71 @@ impl<O: InnerOrder> OrderBooks<O> {
     }
 }
 
-/// Load snapshots from CLI-generated JSON (without height prefix)
-/// Height is read separately from visor_abci_state.json
-pub(crate) fn load_snapshots_from_cli_str<O, R>(str: &str, height: u64) -> Result<(u64, Snapshots<O>)>
+fn split_snapshot_payload(
+    value: serde_json::Value,
+    exact_source_height: Option<u64>,
+) -> Result<(u64, serde_json::Value)> {
+    let (embedded_height, snapshot_value) = match value {
+        serde_json::Value::Array(mut values) => {
+            if values.len() == 2 {
+                if let Some(height) = values[0].as_u64() {
+                    let snapshot_value =
+                        values.pop().ok_or("height-prefixed snapshot is missing the snapshot payload")?;
+                    (Some(height), snapshot_value)
+                } else {
+                    (None, serde_json::Value::Array(values))
+                }
+            } else {
+                (None, serde_json::Value::Array(values))
+            }
+        }
+        serde_json::Value::Object(mut object) => {
+            let embedded_height = object.remove("height").and_then(|height| height.as_u64());
+            let snapshot_value = ["snapshot", "snapshots", "data", "value"]
+                .into_iter()
+                .find_map(|key| object.remove(key))
+                .ok_or("height object snapshot is missing snapshot/snapshots/data/value payload")?;
+            (embedded_height, snapshot_value)
+        }
+        _ => return Err("snapshot JSON must be either a snapshot array or a height-prefixed payload".into()),
+    };
+
+    let height = match (embedded_height, exact_source_height) {
+        (Some(embedded), Some(source)) if embedded != source => {
+            return Err(format!("embedded snapshot height {embedded} does not match source height {source}").into());
+        }
+        (Some(embedded), _) => embedded,
+        (None, Some(source)) => source,
+        (None, None) => {
+            return Err("snapshot JSON has no embedded height and no exact source height was provided; \
+                 refusing to use live visor height because it can skip replay events"
+                .into());
+        }
+    };
+
+    Ok((height, snapshot_value))
+}
+
+/// Load snapshots from CLI-generated JSON.
+///
+/// Safe height sources:
+/// - embedded height in a height-prefixed snapshot file;
+/// - `exact_source_height` from the frozen source itself, e.g.
+///   `periodic_abci_states/{date}/{height}.rmp`.
+///
+/// Live visor height is intentionally not accepted here.
+pub(crate) fn load_snapshots_from_cli_str<O, R>(
+    str: &str,
+    exact_source_height: Option<u64>,
+) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
+    R: Serialize + DeserializeOwned,
 {
     #[allow(clippy::type_complexity)]
-    let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_str(str)?;
+    let value: serde_json::Value = serde_json::from_str(str)?;
+    let (height, snapshot_value) = split_snapshot_payload(value, exact_source_height)?;
+    let snapshot: Vec<(String, [Vec<R>; 2])> = serde_json::from_value(snapshot_value)?;
     Ok((
         height,
         Snapshots::new(
@@ -161,27 +260,22 @@ where
     ))
 }
 
-/// Load snapshots from CLI-generated JSON file + height from visor state
+/// Load snapshots from CLI-generated JSON file.
 pub(crate) async fn load_snapshots_from_cli_json<O, R>(
     snapshot_path: &Path,
-    visor_state_path: &Path,
+    exact_source_height: Option<u64>,
 ) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
+    R: Serialize + DeserializeOwned,
 {
-    // Read height from visor_abci_state.json
-    let visor_state = read_to_string(visor_state_path).await?;
-    let visor: serde_json::Value = serde_json::from_str(&visor_state)?;
-    let height = visor["height"].as_u64().ok_or("Missing height in visor state")?;
-
-    // Read snapshot
     let file_contents = read_to_string(snapshot_path).await?;
-    load_snapshots_from_cli_str(&file_contents, height)
+    load_snapshots_from_cli_str(&file_contents, exact_source_height)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::load_snapshots_from_cli_str;
     use crate::{
         order_book::{
             InnerOrder, OrderBook, Px, Side, Snapshot, Sz,
@@ -202,7 +296,7 @@ mod tests {
 
     fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
     where
-        O: TryFrom<R, Error = crate::prelude::Error>,
+        O: TryFrom<R, Error = Error>,
         R: Serialize + for<'a> Deserialize<'a>,
     {
         #[allow(clippy::type_complexity)]
@@ -224,7 +318,7 @@ mod tests {
 
     async fn load_snapshots_from_json<O, R>(path: &PathBuf) -> Result<(u64, Snapshots<O>)>
     where
-        O: TryFrom<R, Error = crate::prelude::Error>,
+        O: TryFrom<R, Error = Error>,
         R: Serialize + for<'a> Deserialize<'a>,
     {
         let file_contents = read_to_string(path).await?;
@@ -403,6 +497,49 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_snapshot_loader_accepts_embedded_height() -> Result<()> {
+        let (height, _) = load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON, None)?;
+        assert_eq!(height, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_snapshot_loader_uses_exact_source_height_for_raw_snapshot() -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(SNAPSHOT_JSON)?;
+        let raw_snapshot =
+            value.as_array().and_then(|values| values.get(1)).ok_or("test fixture must be a height-prefixed tuple")?;
+        let raw_snapshot = serde_json::to_string(raw_snapshot)?;
+
+        let (height, _) = load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(&raw_snapshot, Some(99))?;
+        assert_eq!(height, 99);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_snapshot_loader_rejects_raw_snapshot_without_exact_height() -> Result<()> {
+        let value: serde_json::Value = serde_json::from_str(SNAPSHOT_JSON)?;
+        let raw_snapshot =
+            value.as_array().and_then(|values| values.get(1)).ok_or("test fixture must be a height-prefixed tuple")?;
+        let raw_snapshot = serde_json::to_string(raw_snapshot)?;
+
+        let err = match load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(&raw_snapshot, None) {
+            Ok(_) => panic!("raw snapshot without exact height must fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("no embedded height"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cli_snapshot_loader_rejects_height_mismatch() {
+        let err = match load_snapshots_from_cli_str::<InnerL4Order, (Address, L4Order)>(SNAPSHOT_JSON, Some(101)) {
+            Ok(_) => panic!("mismatched embedded/source heights must fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("does not match source height"), "{err}");
+    }
+
+    #[test]
     fn test_l4_snapshot_to_l2_snapshot() {
         let mut book = OrderBook::new();
         let coin = Coin::new("");
@@ -497,6 +634,24 @@ mod tests {
         // The coin must be present with an empty BBO - skipping it left
         // subscribers holding the last quote forever after a delisting.
         assert_eq!(bbos.get(&Coin::new("BTC")), Some(&(None, None)));
+    }
+
+    #[test]
+    fn test_hip4_bbo_merges_complementary_sibling_liquidity() {
+        let mut books: OrderBooks<InnerL4Order> = OrderBooks::from_snapshots(Snapshots::new(HashMap::new()), true);
+        books.add_order(make_order(1, "#7510", Side::Bid, "10", "0.8"));
+        books.add_order(make_order(2, "#7510", Side::Ask, "2", "0.9"));
+        books.add_order(make_order(3, "#7511", Side::Bid, "3", "0.1")); // mirrored as #7510 ask 0.9
+        books.add_order(make_order(4, "#7511", Side::Ask, "4", "0.3")); // mirrored as #7510 bid 0.7
+
+        let coins: std::collections::HashSet<Coin> = std::iter::once(Coin::new("#7510")).collect();
+        let bbos = books.get_bbos_for_coins(&coins);
+        let (bid, ask) = bbos.get(&Coin::new("#7510")).unwrap();
+        let bid = bid.unwrap();
+        let ask = ask.unwrap();
+
+        assert_eq!((bid.0.to_str(), bid.1.to_str(), bid.2), ("0.8".to_string(), "10".to_string(), 1));
+        assert_eq!((ask.0.to_str(), ask.1.to_str(), ask.2), ("0.9".to_string(), "5".to_string(), 2));
     }
 
     #[test]

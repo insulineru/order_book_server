@@ -7,7 +7,7 @@ use crate::{
         PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
     },
     order_book::{
-        Coin, Px, Side, Snapshot, Sz,
+        Coin, MarketFilter, Px, Side, Snapshot, Sz,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
     },
     prelude::*,
@@ -32,7 +32,7 @@ use tokio::{
     },
     time::{Instant, MissedTickBehavior, interval},
 };
-use utils::{EventBatch, SnapshotConfig, get_visor_path, process_rmp_file, read_visor_height};
+use utils::{EventBatch, SnapshotConfig, fetch_l4_snapshot, startup_backfill_min_height};
 
 /// Minimum interval between L2 broadcasts. Caps the broadcast rate at 20/sec; the
 /// conflation buffer accumulates dirty coins between broadcasts.
@@ -46,6 +46,15 @@ const L2_FLUSH_TICK_MS: u64 = 10;
 /// means something is pathologically wrong, so we drop the cache and schedule
 /// another re-sync rather than risk OOM.
 const MAX_CACHED_EVENTS: usize = 1_000_000;
+
+fn pending_startup_backfill_sources(statuses: bool, diffs: bool) -> &'static str {
+    match (statuses, diffs) {
+        (true, true) => "OrderStatuses, OrderDiffs",
+        (true, false) => "OrderStatuses",
+        (false, true) => "OrderDiffs",
+        (false, false) => "none",
+    }
+}
 
 mod parallel;
 mod state;
@@ -71,14 +80,18 @@ fn fetch_snapshot(
         }
 
         // Now generate snapshot - any events during this time are cached
-        let visor_path = get_visor_path(&snapshot_config);
-        let res = match process_rmp_file(&snapshot_config).await {
-            Ok(output_fln) => {
-                let snapshot =
-                    load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
+        let res = match fetch_l4_snapshot(&snapshot_config).await {
+            Ok(artifact) => {
+                let snapshot = load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(
+                    &artifact.path,
+                    Some(artifact.exact_source_height),
+                )
+                .await;
                 info!("Snapshot fetched");
                 match snapshot {
-                    Ok((height, expected_snapshot)) => {
+                    Ok((height, mut expected_snapshot)) => {
+                        let market_filter = listener.lock().await.market_filter;
+                        expected_snapshot.retain_coins(|coin| market_filter.matches(coin));
                         info!("Snapshot loaded at height {}", height);
                         // Reinitialize from the snapshot and replay the cached
                         // events above its height in one lock acquisition, so no
@@ -98,9 +111,9 @@ fn fetch_snapshot(
 
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
-    // (include_perps, include_spot, include_hip3) - used to filter the universe
-    // handed to connections for subscription validation.
-    market_filter: (bool, bool, bool),
+    // Market filter used both for subscription validation and early event/snapshot
+    // filtering. HIP-4-only mode must not build or replay the full perp firehose.
+    market_filter: MarketFilter,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     // Some while a snapshot fetch is in flight (initial startup and re-syncs):
@@ -165,7 +178,7 @@ impl OrderBookListener {
         internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
         ignore_spot: bool,
         active_l2_params: ActiveL2Params,
-        market_filter: (bool, bool, bool),
+        market_filter: MarketFilter,
     ) -> Self {
         Self {
             ignore_spot,
@@ -275,7 +288,7 @@ impl OrderBookListener {
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {}", height);
-        let mut new_state = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        let mut new_state = OrderBookState::from_snapshot(snapshot, height, 0, true, self.market_filter);
 
         // Replay every cached batch above the snapshot height. Batches at or
         // below the height are already reflected in the snapshot; newer ones
@@ -294,7 +307,13 @@ impl OrderBookListener {
                 }
                 EventBatch::BookDiffs(b) if b.block_number() > height => {
                     replayed += b.events_len();
-                    new_state.apply_order_diffs_hft(b).map(|_| ())
+                    new_state.apply_order_diffs_hft(b).and_then(|outcome| {
+                        if outcome.data_loss {
+                            Err("replayed diff referenced an unknown oid or crossed the book".into())
+                        } else {
+                            Ok(())
+                        }
+                    })
                 }
                 _ => Ok(()),
             };
@@ -323,11 +342,8 @@ impl OrderBookListener {
             self.needs_resync = true;
             // Downgrade an uninformed (u64::MAX) bound now that real heights
             // have been observed, so the next fetch can actually clear it.
-            self.max_loss_height = if prior_loss_height == u64::MAX {
-                self.last_seen_height.max(height)
-            } else {
-                prior_loss_height
-            };
+            self.max_loss_height =
+                if prior_loss_height == u64::MAX { self.last_seen_height.max(height) } else { prior_loss_height };
         }
 
         // The incremental L2 cache references the previous book's coins/levels;
@@ -353,8 +369,13 @@ impl OrderBookListener {
 }
 
 /// Does `coin` belong to one of the enabled market types?
-fn coin_in_market_filter(coin: &Coin, (include_perps, include_spot, include_hip3): (bool, bool, bool)) -> bool {
-    (coin.is_perp() && include_perps) || (coin.is_spot() && include_spot) || (coin.is_hip3() && include_hip3)
+fn coin_in_market_filter(coin: &Coin, market_filter: MarketFilter) -> bool {
+    market_filter.matches(coin)
+}
+
+fn expand_hip4_sibling_coins(coins: &mut HashSet<Coin>) {
+    let siblings: Vec<Coin> = coins.iter().filter_map(Coin::hip4_sibling).collect();
+    coins.extend(siblings);
 }
 
 /// Parse one streaming line into (block height, typed event batch). Runs WITHOUT
@@ -413,7 +434,6 @@ fn parse_event_line(line: &str, event_source: EventSource) -> Option<(u64, Event
         }
     }
 }
-
 
 /// Lazily-serialized wire frame shared by every subscribed connection. The
 /// first connection that needs the frame pays the `serde_json` cost once; every
@@ -533,29 +553,28 @@ impl L2FrameCache {
 /// Pairs the two fill legs of each trade match into one public-schema print,
 /// grouped per coin for broadcast.
 ///
-/// A match produces two fill records (buyer + seller) sharing a `tid`. The
-/// node emits them as immediate neighbours in the fills stream — adjacent
-/// within a block, and in `--stream-with-block-info` mode as two consecutive
-/// single-event `Fills` batches. So pairing only needs to remember the single
-/// previous leg: when the next leg shares its `tid` they form a trade;
-/// otherwise the previous leg was unpairable and is dropped. This is O(1) per
-/// fill, allocates nothing beyond the output, and cannot leak — at most one
-/// leg is ever held.
+/// A match produces two fill records (buyer + seller) sharing a `tid`. In quiet
+/// windows those legs usually arrive adjacent, but burst sweeps can interleave
+/// many tids. Pair by `tid` instead of assuming adjacency, with a hard cap so a
+/// bad stream cannot grow memory without bound.
 ///
 /// Dropped legs are counted in `TRADES_UNPAIRED_FILLS_TOTAL` — ~0 in steady
-/// state; growth means the node stopped emitting the two legs of a match
-/// adjacently and pairing should be revisited.
+/// state; growth means fills are missing, malformed, or the bounded pending map
+/// overflowed.
 #[derive(Default)]
 struct TradePairer {
-    prev: Option<NodeDataFill>,
+    pending: HashMap<u64, NodeDataFill>,
 }
 
 impl TradePairer {
     fn group(&mut self, batch: Batch<NodeDataFill>) -> HashMap<String, CoinTrades> {
+        const MAX_PENDING_TRADE_LEGS: usize = 10_000;
+
         let mut by_coin: HashMap<String, Vec<Trade>> = HashMap::new();
         for fill in batch.events() {
-            match self.prev.take() {
-                Some(prev) if prev.1.tid == fill.1.tid => {
+            let tid = fill.1.tid;
+            match self.pending.remove(&tid) {
+                Some(prev) => {
                     let (bid, ask) = if fill.1.side == Side::Bid { (fill, prev) } else { (prev, fill) };
                     if let Some(trade) = Trade::from_fills(bid, ask) {
                         by_coin.entry(trade.coin.clone()).or_default().push(trade);
@@ -565,12 +584,14 @@ impl TradePairer {
                         TRADES_UNPAIRED_FILLS_TOTAL.inc_by(2);
                     }
                 }
-                Some(_) => {
-                    // Previous leg never met its counterpart: unpairable, drop it.
-                    TRADES_UNPAIRED_FILLS_TOTAL.inc();
-                    self.prev = Some(fill);
+                None => {
+                    self.pending.insert(tid, fill);
+                    if self.pending.len() > MAX_PENDING_TRADE_LEGS {
+                        TRADES_UNPAIRED_FILLS_TOTAL.inc_by(self.pending.len() as u64);
+                        log::warn!("Clearing {} unpaired trade legs", self.pending.len());
+                        self.pending.clear();
+                    }
                 }
-                None => self.prev = Some(fill),
             }
         }
         by_coin
@@ -581,13 +602,13 @@ impl TradePairer {
 }
 
 /// Group order diffs per coin (one clone per event - the batch itself is
-/// consumed by the state apply). `skip_spot` folds the `--markets` filtering
-/// in, replacing the old whole-batch `filter_events` clone.
-fn group_diffs_by_coin(events: &[NodeDataOrderDiff], skip_spot: bool) -> HashMap<String, CoinDiffs> {
+/// consumed by the state apply). The market filter folds the `--markets`
+/// filtering in, replacing the old whole-batch `filter_events` clone.
+fn group_diffs_by_coin(events: &[NodeDataOrderDiff], market_filter: MarketFilter) -> HashMap<String, CoinDiffs> {
     let mut by_coin: HashMap<String, Vec<NodeDataOrderDiff>> = HashMap::new();
     for diff in events {
         let coin = diff.coin();
-        if skip_spot && coin.is_spot() {
+        if !market_filter.matches(&coin) {
             continue;
         }
         by_coin.entry(coin.value()).or_default().push(diff.clone());
@@ -597,16 +618,27 @@ fn group_diffs_by_coin(events: &[NodeDataOrderDiff], skip_spot: bool) -> HashMap
         .map(|(coin, diffs)| {
             (
                 coin,
-                CoinDiffs { diffs: Arc::new(diffs), book_diffs_frame: SharedFrame::new(), l4_frame: SharedFrame::new() },
+                CoinDiffs {
+                    diffs: Arc::new(diffs),
+                    book_diffs_frame: SharedFrame::new(),
+                    l4_frame: SharedFrame::new(),
+                },
             )
         })
         .collect()
 }
 
 /// Group order statuses per coin (one clone per event).
-fn group_statuses_by_coin(events: &[NodeDataOrderStatus]) -> HashMap<String, CoinStatuses> {
+fn group_statuses_by_coin(
+    events: &[NodeDataOrderStatus],
+    market_filter: MarketFilter,
+) -> HashMap<String, CoinStatuses> {
     let mut by_coin: HashMap<String, Vec<NodeDataOrderStatus>> = HashMap::new();
     for status in events {
+        let coin = Coin::new(&status.order.coin);
+        if !market_filter.matches(&coin) {
+            continue;
+        }
         by_coin.entry(status.order.coin.clone()).or_default().push(status.clone());
     }
     by_coin
@@ -673,6 +705,9 @@ impl OrderBookListener {
     /// the batch cannot be used safely - mark the book for re-sync instead; the
     /// re-fetched snapshot's height supersedes everything the backfill carried.
     fn cache_backfill_batch(&mut self, event_batch: EventBatch) {
+        let Some(event_batch) = event_batch.filter_market(self.market_filter) else {
+            return;
+        };
         if matches!(event_batch, EventBatch::Fills(_)) {
             return;
         }
@@ -697,6 +732,10 @@ impl OrderBookListener {
         // Track the highest live-stream height: it bounds the height of any
         // data loss whose exact position is unknown (see mark_desynced).
         self.last_seen_height = self.last_seen_height.max(height);
+
+        let Some(event_batch) = event_batch.filter_market(self.market_filter) else {
+            return;
+        };
 
         // Sanity cap on batch size. A malformed/malicious line could otherwise
         // pin hundreds of MB and freeze the listener for seconds.
@@ -731,7 +770,7 @@ impl OrderBookListener {
         // Collected here and applied after the state borrow ends.
         let mut desync_reason: Option<&'static str> = None;
 
-        let changed_coins: HashSet<Coin> = if let Some(state) = self.order_book_state.as_mut() {
+        let mut changed_coins: HashSet<Coin> = if let Some(state) = self.order_book_state.as_mut() {
             let result = match event_batch {
                 EventBatch::Orders(batch) => {
                     // Broadcast L4 order statuses for L4Book / orderUpdates
@@ -743,13 +782,13 @@ impl OrderBookListener {
                             let msg = Arc::new(InternalMessage::L4OrderStatuses {
                                 time: batch.block_time(),
                                 height: batch.block_number(),
-                                statuses_by_coin: group_statuses_by_coin(batch.events_ref()),
+                                statuses_by_coin: group_statuses_by_coin(batch.events_ref(), state.market_filter()),
                             });
                             drop(tx.send(msg));
                         }
                     }
                     EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
-                    state.apply_order_statuses_hft(batch)
+                    state.apply_order_statuses_hft(batch).map(|changed_coins| (changed_coins, false))
                 }
                 EventBatch::BookDiffs(batch) => {
                     // Broadcast L4 order diffs for L4Book / BookDiffs subscribers,
@@ -760,7 +799,7 @@ impl OrderBookListener {
                     // applied locally.
                     if let Some(tx) = &self.internal_message_tx {
                         if tx.receiver_count() > 0 {
-                            let diffs_by_coin = group_diffs_by_coin(batch.events_ref(), state.ignore_spot());
+                            let diffs_by_coin = group_diffs_by_coin(batch.events_ref(), state.market_filter());
                             if !diffs_by_coin.is_empty() {
                                 let msg = Arc::new(InternalMessage::L4OrderDiffs {
                                     time: batch.block_time(),
@@ -772,7 +811,7 @@ impl OrderBookListener {
                         }
                     }
                     EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
-                    state.apply_order_diffs_hft(batch)
+                    state.apply_order_diffs_hft(batch).map(|outcome| (outcome.changed_coins, outcome.data_loss))
                 }
                 EventBatch::Fills(batch) => {
                     EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
@@ -786,12 +825,17 @@ impl OrderBookListener {
                             }
                         }
                     }
-                    Ok(HashSet::new())
+                    Ok((HashSet::new(), false))
                 }
             };
 
             match result {
-                Ok(coins) => coins,
+                Ok((coins, data_loss)) => {
+                    if data_loss {
+                        desync_reason = Some("book_consistency");
+                    }
+                    coins
+                }
                 Err(err) => {
                     // Per-event errors (malformed Px/Sz, unrecognized diff variant) are
                     // recoverable: skip the offending batch and keep serving every other
@@ -801,7 +845,8 @@ impl OrderBookListener {
                     PARSE_ERRORS_TOTAL.with_label_values(&[source_label]).inc();
                     log::warn!(
                         "Skipping event batch at height={} source={} due to apply error: {err}",
-                        height, source_label
+                        height,
+                        source_label
                     );
                     desync_reason = Some("apply_error");
                     HashSet::new()
@@ -810,6 +855,7 @@ impl OrderBookListener {
         } else {
             HashSet::new()
         };
+        expand_hip4_sibling_coins(&mut changed_coins);
         EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
 
         // Log HFT state progress periodically
@@ -859,7 +905,12 @@ impl OrderBookListener {
                         static BBO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let bc = BBO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if bc % 1000 == 0 {
-                            log::debug!("Fast BBO broadcast #{} at time {} for {} coins", bc, time, changed_coins.len());
+                            log::debug!(
+                                "Fast BBO broadcast #{} at time {} for {} coins",
+                                bc,
+                                time,
+                                changed_coins.len()
+                            );
                         }
                         // broadcast::Sender::send is non-blocking; the previous
                         // tokio::spawn wrapper added task overhead with no benefit.
@@ -1023,29 +1074,16 @@ pub(crate) enum InternalMessage {
     },
     /// Trades grouped per coin ONCE in the listener; connections share the
     /// Arc'd vectors AND the lazily-serialized wire frame per coin.
-    Fills {
-        trades_by_coin: HashMap<String, CoinTrades>,
-    },
+    Fills { trades_by_coin: HashMap<String, CoinTrades> },
     /// Fast BBO-only broadcast path - bypasses expensive L2 snapshot computation.
     /// Connections dedup on the raw values and share the per-coin wire frame.
-    BboUpdate {
-        bbos: HashMap<Coin, CoinBbo>,
-        time: u64,
-    },
+    BboUpdate { bbos: HashMap<Coin, CoinBbo>, time: u64 },
     /// HFT L4 streaming - order diffs without waiting for status pairing,
     /// grouped per coin once (shared by l4Book and bookDiffs subscribers).
-    L4OrderDiffs {
-        time: u64,
-        height: u64,
-        diffs_by_coin: HashMap<String, CoinDiffs>,
-    },
+    L4OrderDiffs { time: u64, height: u64, diffs_by_coin: HashMap<String, CoinDiffs> },
     /// HFT L4 streaming - order statuses without waiting for diff pairing,
     /// grouped per coin once (shared by l4Book and orderUpdates subscribers).
-    L4OrderStatuses {
-        time: u64,
-        height: u64,
-        statuses_by_coin: HashMap<String, CoinStatuses>,
-    },
+    L4OrderStatuses { time: u64, height: u64, statuses_by_coin: HashMap<String, CoinStatuses> },
 }
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy)]
@@ -1139,7 +1177,6 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         hlnode_binary: config.hlnode_binary.clone(),
         abci_state_path: config.abci_state_path.clone(),
         snapshot_output_path: config.snapshot_output_path.clone(),
-        visor_state_path: config.visor_state_path.clone(),
         data_dir: dir.clone(),
     };
 
@@ -1148,13 +1185,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         listener.ignore_spot
     };
 
-    // Startup-backfill floor: the node's currently persisted height. The initial
-    // snapshot is generated after this point, so its height is >= the floor and
-    // every line at or below it is already covered by the snapshot. The watchers
-    // backfill on-disk lines above the floor that the old seek-to-EOF behavior
-    // skipped. 0 (visor unreadable) disables the backfill - the snapshot load
-    // would fail on the same file anyway.
-    let backfill_min_height = read_visor_height(&get_visor_path(&snapshot_config)).unwrap_or(0);
+    // Startup-backfill floor must come from the same source as the snapshot
+    // contents. Using live visor height here skips `(H_snapshot, H_visor]` when
+    // the frozen state file lags.
+    let backfill_min_height = startup_backfill_min_height(&snapshot_config)?;
     info!("Startup backfill floor height: {backfill_min_height}");
 
     // Start parallel file watchers. They send straight into the bounded tokio
@@ -1164,6 +1198,8 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     // watcher must not let the server keep serving a silently frozen book.
     let (mut tokio_rx, watcher_handles, last_order_statuses, _last_fills, last_order_diffs) =
         parallel::start_parallel_file_watchers(dir, backfill_min_height);
+    let mut startup_backfill_pending_statuses = backfill_min_height > 0;
+    let mut startup_backfill_pending_diffs = backfill_min_height > 0;
 
     // Snapshot fetch channel
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
@@ -1192,6 +1228,7 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
     enum Action {
         Apply(u64, EventBatch, EventSource),
         Backfill(EventBatch),
+        BackfillComplete(EventSource),
         Desync,
     }
 
@@ -1233,6 +1270,10 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         parallel::FileEvent::Fill(line) => (line, EventSource::Fills, false),
                         parallel::FileEvent::BackfillOrderDiff(line) => (line, EventSource::OrderDiffs, true),
                         parallel::FileEvent::BackfillOrderStatus(line) => (line, EventSource::OrderStatuses, true),
+                        parallel::FileEvent::BackfillComplete(source) => {
+                            actions.push(Action::BackfillComplete(source));
+                            continue;
+                        }
                         parallel::FileEvent::Desync(source) => {
                             // The watcher discarded data (oversized partial line);
                             // the book can no longer be trusted - trigger a re-sync.
@@ -1257,6 +1298,27 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                         match action {
                             Action::Apply(height, batch, source) => guard.apply_event_batch(height, batch, source),
                             Action::Backfill(batch) => guard.cache_backfill_batch(batch),
+                            Action::BackfillComplete(source) => {
+                                let was_pending =
+                                    startup_backfill_pending_statuses || startup_backfill_pending_diffs;
+                                match source {
+                                    EventSource::OrderStatuses => startup_backfill_pending_statuses = false,
+                                    EventSource::OrderDiffs => startup_backfill_pending_diffs = false,
+                                    EventSource::Fills => {}
+                                }
+                                let pending = pending_startup_backfill_sources(
+                                    startup_backfill_pending_statuses,
+                                    startup_backfill_pending_diffs,
+                                );
+                                if was_pending
+                                    && !startup_backfill_pending_statuses
+                                    && !startup_backfill_pending_diffs
+                                {
+                                    info!("Startup backfill barrier complete; initial snapshot may start");
+                                } else {
+                                    info!("Startup backfill complete for {source}; waiting for {pending}");
+                                }
+                            }
                             Action::Desync => guard.mark_desynced("watcher_data_loss"),
                         }
                     }
@@ -1316,7 +1378,16 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                     let guard = listener.lock().await;
                     (guard.is_ready(), guard.needs_resync())
                 };
-                info!("Ticker: is_ready={is_ready}, needs_resync={needs_resync}, snapshot_fetch_pending={snapshot_fetch_pending}");
+                let startup_backfill_pending = startup_backfill_pending_statuses || startup_backfill_pending_diffs;
+                let pending_backfill_sources =
+                    pending_startup_backfill_sources(startup_backfill_pending_statuses, startup_backfill_pending_diffs);
+                info!(
+                    "Ticker: is_ready={is_ready}, needs_resync={needs_resync}, snapshot_fetch_pending={snapshot_fetch_pending}, startup_backfill_pending={pending_backfill_sources}"
+                );
+                if !is_ready && startup_backfill_pending {
+                    info!("Waiting for startup backfill before initial snapshot: {pending_backfill_sources}");
+                    continue;
+                }
                 if (!is_ready || needs_resync) && !snapshot_fetch_pending {
                     snapshot_fetch_pending = true;
                     let listener = listener.clone();
@@ -1337,7 +1408,8 @@ mod tests {
     /// broadcast receiver so `receiver_count() > 0`.
     fn ready_listener() -> (OrderBookListener, tokio::sync::broadcast::Receiver<Arc<InternalMessage>>) {
         let (tx, rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        let mut listener =
+            OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), MarketFilter::new(true, false, true, true));
         listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
         (listener, rx)
     }
@@ -1431,7 +1503,12 @@ mod tests {
         .unwrap()
     }
 
-    fn make_diff_batch(coin: &str, oid: u64, height: u64, raw_book_diff: serde_json::Value) -> Batch<NodeDataOrderDiff> {
+    fn make_diff_batch(
+        coin: &str,
+        oid: u64,
+        height: u64,
+        raw_book_diff: serde_json::Value,
+    ) -> Batch<NodeDataOrderDiff> {
         serde_json::from_value(serde_json::json!({
             "local_time": "2024-01-15T10:30:00.000000000",
             "block_time": "2024-01-15T10:30:00.000000000",
@@ -1479,7 +1556,7 @@ mod tests {
     #[test]
     fn test_startup_events_cached_and_replayed_above_snapshot_height() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), MarketFilter::all());
         assert!(!listener.is_ready());
 
         // Events stream in while the snapshot is being generated (book not ready).
@@ -1520,7 +1597,8 @@ mod tests {
     #[test]
     fn test_cache_overflow_keeps_book_desynced_until_clean_resync() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        let mut listener =
+            OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), MarketFilter::new(true, false, true, true));
         listener.set_cache_event_cap(1);
 
         feed_order(&mut listener, "AAA", 1, 10); // 2 single-event batches: second one overflows
@@ -1629,10 +1707,7 @@ mod tests {
         listener.set_tolerate_drift(true);
         // A loss that would normally schedule a re-fetch...
         listener.mark_desynced("pending_cache_cleared");
-        assert!(
-            !listener.needs_resync(),
-            "with tolerate_drift set, a desync must not schedule a snapshot re-fetch"
-        );
+        assert!(!listener.needs_resync(), "with tolerate_drift set, a desync must not schedule a snapshot re-fetch");
         // ...and the higher-level late-backfill path stays quiet too.
         listener.cache_backfill_batch(EventBatch::Orders(make_status_batch("BTC", 1, 99)));
         assert!(!listener.needs_resync(), "tolerate_drift must suppress the late-backfill desync path as well");
@@ -1695,7 +1770,11 @@ mod tests {
     #[test]
     fn test_fills_broadcast_grouped_by_coin() {
         let (mut listener, mut rx) = ready_listener();
-        listener.apply_event_batch(1, EventBatch::Fills(make_fills_batch(&["BTC", "ETH", "BTC"], 1)), EventSource::Fills);
+        listener.apply_event_batch(
+            1,
+            EventBatch::Fills(make_fills_batch(&["BTC", "ETH", "BTC"], 1)),
+            EventSource::Fills,
+        );
 
         let mut found = false;
         while let Ok(msg) = rx.try_recv() {
@@ -1732,7 +1811,8 @@ mod tests {
                     "closedPnl": "0", "hash": "0xabc", "oid": tid, "crossed": crossed,
                     "fee": "0.5", "tid": tid, "feeToken": "USDC"
                 }]]
-            })).unwrap()
+            }))
+            .unwrap()
         };
         let mut p = TradePairer::default();
         // Seller (ask) crossed => taker => aggressor side "A".
@@ -1740,6 +1820,33 @@ mod tests {
         let grouped = p.group(leg(5, "B", false, "0x0000000000000000000000000000000000000001"));
         assert_eq!(grouped["BTC"].trades.len(), 1);
         assert_eq!(serde_json::to_value(&grouped["BTC"].trades[0]).unwrap()["side"], "A");
+    }
+
+    #[test]
+    fn test_fills_pair_when_trade_legs_are_interleaved() {
+        let leg = |tid: u64, side: &str, crossed: bool, user: &str| {
+            serde_json::json!([user, {
+                "coin": "BTC", "px": "100.0", "sz": "1.0", "side": side,
+                "time": 1_700_000_000_000_u64, "startPosition": "0", "dir": "Open Long",
+                "closedPnl": "0", "hash": "0xabc", "oid": tid, "crossed": crossed,
+                "fee": "0.5", "tid": tid, "feeToken": "USDC"
+            }])
+        };
+        let batch: Batch<NodeDataFill> = serde_json::from_value(serde_json::json!({
+            "local_time": "2024-01-15T10:30:00.000000000",
+            "block_time": "2024-01-15T10:30:00.000000000",
+            "block_number": 1,
+            "events": [
+                leg(1, "B", true, "0x0000000000000000000000000000000000000001"),
+                leg(2, "B", true, "0x0000000000000000000000000000000000000003"),
+                leg(1, "A", false, "0x0000000000000000000000000000000000000002"),
+                leg(2, "A", false, "0x0000000000000000000000000000000000000004")
+            ]
+        }))
+        .unwrap();
+
+        let grouped = TradePairer::default().group(batch);
+        assert_eq!(grouped["BTC"].trades.len(), 2, "interleaved tids must both pair");
     }
 
     #[test]
@@ -1813,7 +1920,11 @@ mod tests {
     #[test]
     fn test_all_spot_diff_batch_broadcasts_nothing() {
         let (mut listener, mut rx) = ready_listener(); // ignore_spot=true
-        listener.apply_event_batch(1, EventBatch::BookDiffs(make_multi_diff_batch(&["@1"], 1)), EventSource::OrderDiffs);
+        listener.apply_event_batch(
+            1,
+            EventBatch::BookDiffs(make_multi_diff_batch(&["@1"], 1)),
+            EventSource::OrderDiffs,
+        );
         while let Ok(msg) = rx.try_recv() {
             assert!(
                 !matches!(msg.as_ref(), InternalMessage::L4OrderDiffs { .. }),
