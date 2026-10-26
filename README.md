@@ -126,7 +126,7 @@ The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
 After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify.
 
-The handoff from snapshot to live stream is **gapless**: at startup the server backfills the streaming files from the exact periodic ABCI snapshot height, and every event that arrives while the snapshot is being generated is cached and replayed on top of it (filtered by block height, so nothing is double-applied). If the server ever detects that events were provably lost (a corrupt line, an oversized batch, watcher data loss), it marks the book out-of-sync and automatically re-fetches a snapshot in the background while continuing to serve — see `orderbook_desyncs_total` in the metrics.
+At startup, the server backfills streaming files from the exact periodic ABCI snapshot height and replays events cached during snapshot generation. Detected event loss schedules a background snapshot fetch. Background resync does not backfill the interval between an older periodic state file and the start of its replay cache, so it must not be treated as gapless recovery. See [Consistency and recovery limits](#consistency-and-recovery-limits).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -387,14 +387,14 @@ The Hyperliquid node must run with **all** of these flags enabled:
 
 ## Performance
 
-### Consistency (no-drift) guarantees
+### Consistency and recovery limits
 
-The in-memory book is kept consistent with the node through three layers:
+1. **Startup backfill** reads streaming files from the exact periodic ABCI snapshot height before starting the initial snapshot. Replay then applies cached events above that height.
+2. **Background resync** starts caching when the fetch begins, but its periodic source can be older. Unlike startup, it does not backfill that earlier interval. Events in that interval can be missing from the installed book.
+3. **Loss bounds and retry pacing** keep resync scheduled when a snapshot is older than the recorded loss. Retries back off to 300 seconds and can repeatedly launch a full snapshot child until a newer periodic state appears. A new source covering the loss bound does not by itself prove replay continuity.
+4. **Watcher watchdog** exits if a file watcher thread dies or every watcher channel closes. A live watcher silent for two minutes is logged. Health reports ingest recency, including valid batches outside the selected market filter; `ready` does not certify book consistency or the absence of a resync loop.
 
-1. **Startup backfill** - at boot, the watchers read the streaming files from the exact periodic ABCI snapshot height (not from end-of-file), so data written before the server started is not skipped.
-2. **Snapshot replay** - every book-affecting event that arrives while a snapshot is being generated is cached and replayed above the snapshot height, making the snapshot-to-stream handoff gapless.
-3. **Desync self-healing** - any provable event loss (parse/apply error on a batch, oversized batch, watcher buffer discard, pending-cache eviction) marks the book out-of-sync and triggers an automatic background snapshot re-fetch. The book keeps serving its current state until the fresh snapshot lands. Each loss is recorded with a block-height bound, and the out-of-sync flag only clears once a snapshot's height actually covers that bound - a snapshot generated from lagging node state cannot mask a newer loss. Each occurrence is counted in `orderbook_desyncs_total{reason}`. The status/diff pairing caches are evicted by age (60 s): expected orphans are dropped silently, while an unpaired diff aging out counts as data loss and re-syncs the book.
-4. **Watcher watchdog** - if a file watcher thread dies (or every watcher channel closes), the server exits so the process supervisor restarts it into a clean re-sync, instead of serving a silently frozen book that still reports `ready`. A watcher that is alive but has produced no events for 2 minutes is loud-logged (restarting would not fix a stalled node).
+On the deployed partner host, eight consecutive periodic files measured on 2026-10-27 were approximately 12 minutes apart. Snapshot children require several GB of memory. The external recovery watcher gates service restarts on memory and node lag; it does not gate internal resync children. Inspect `marked out-of-sync`, `keeping re-sync scheduled`, and repeated snapshot-ready messages in the server journal. Recovery after a real visor restart remains unverified; do not force a partner-node restart to test it.
 
 ### Deduplication
 
@@ -608,11 +608,9 @@ This fork deduplicates at the WebSocket level:
 - **L2Book**: only sends when the snapshot hash changes (~10us overhead)
 - Saves ~500us per unchanged update and significantly reduces client-side bandwidth
 
-### Drift Protection & Self-Healing
+### Drift detection
 
-The original (and earlier versions of this fork) could silently drift from the node: events arriving during the initial snapshot window were dropped, and any later data loss (corrupt line, oversized batch) corrupted the book permanently until a restart.
-
-This fork makes the snapshot-to-stream handoff gapless (startup backfill from the node's persisted height + height-filtered replay of events cached during snapshot generation) and self-heals from any detected data loss by automatically re-fetching a snapshot in the background. See [Consistency (no-drift) guarantees](#consistency-no-drift-guarantees).
+Startup backfill and cached-event replay address the initial snapshot handoff. Detected data loss schedules another snapshot, with the periodic-source and replay limitations described in [Consistency and recovery limits](#consistency-and-recovery-limits). Automatic refetch is not a guarantee that drift has healed.
 
 ### BBO-Only Lightweight Mode
 
