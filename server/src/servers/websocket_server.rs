@@ -38,7 +38,7 @@ use yawc::{FrameView, OpCode, WebSocket};
 use crate::ServerConfig;
 
 /// Per-(coin, params) cached L2 broadcast. `hash` is used for change-based dedup;
-/// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires,
+/// `payload` is resent verbatim (including its book-event `time`) when the heartbeat fires,
 /// and is only stored when the L2 heartbeat is enabled (default off) - the
 /// change-driven sends use the broadcast's shared frames instead.
 struct L2Entry {
@@ -53,7 +53,7 @@ struct L2Entry {
 type BboKey = (Option<(u64, u64)>, Option<(u64, u64)>);
 
 /// Per-coin cached BBO broadcast. `tuple` is used for change-based dedup;
-/// `payload` is resent verbatim (with refreshed `time`) when the heartbeat fires,
+/// `payload` is resent verbatim (including its book-event `time`) when the heartbeat fires,
 /// and is only stored when the BBO heartbeat is enabled (default off) - the
 /// change-driven sends use the broadcast's shared frames instead.
 struct BboEntry {
@@ -71,6 +71,16 @@ struct BboEntry {
 /// with an explicit value.
 fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>, n_levels: Option<usize>) -> String {
     format!("{}:{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0), n_levels.unwrap_or(DEFAULT_LEVELS))
+}
+
+// Socket arrival proves liveness; a resend must not advance book-event time.
+fn heartbeat_payload<T: Clone>(last_sent: &mut Instant, payload: Option<&T>, now: Instant, period: Duration) -> Option<T> {
+    if now.duration_since(*last_sent) < period {
+        return None;
+    }
+    let payload = payload?.clone();
+    *last_sent = now;
+    Some(payload)
 }
 
 /// Build a tokio interval that fires often enough to drive both heartbeats with
@@ -595,7 +605,6 @@ async fn run_session(
 
             _ = heartbeat_tick(&mut heartbeat_ticker) => {
                 let now = Instant::now();
-                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
                 for sub in manager.subscriptions() {
                     if !alive { break; }
                     match sub {
@@ -605,13 +614,8 @@ async fn run_session(
                             if let Some(entry) = last_l2.get_mut(&key) {
                                 // payload is always Some when the heartbeat is enabled
                                 // (the change-driven send stores it for exactly this).
-                                if now.duration_since(entry.last_sent) >= hb
-                                    && let Some(payload) = entry.payload.as_mut()
-                                {
-                                    payload.set_time(now_ms);
-                                    entry.last_sent = now;
+                                if let Some(payload) = heartbeat_payload(&mut entry.last_sent, entry.payload.as_ref(), now, hb) {
                                     BROADCASTS_TOTAL.with_label_values(&["l2_heartbeat"]).inc();
-                                    let payload = payload.clone();
                                     alive &= outbound.send_message(ServerResponse::L2Book(payload)).await;
                                 }
                             }
@@ -619,13 +623,8 @@ async fn run_session(
                         Subscription::Bbo { coin } => {
                             let Some(hb) = bbo_hb else { continue };
                             if let Some(entry) = last_bbo.get_mut(coin) {
-                                if now.duration_since(entry.last_sent) >= hb
-                                    && let Some(payload) = entry.payload.as_mut()
-                                {
-                                    payload.time = now_ms;
-                                    entry.last_sent = now;
+                                if let Some(payload) = heartbeat_payload(&mut entry.last_sent, entry.payload.as_ref(), now, hb) {
                                     BROADCASTS_TOTAL.with_label_values(&["bbo_heartbeat"]).inc();
-                                    let payload = payload.clone();
                                     alive &= outbound.send_message(ServerResponse::Bbo(payload)).await;
                                 }
                             }
@@ -1655,6 +1654,28 @@ mod tests {
         assert!(outbound.send_payload(bytes::Bytes::from_static(b"x")).await);
         writer.await.unwrap();
         assert!(!outbound.send_payload(bytes::Bytes::from_static(b"y")).await);
+    }
+
+    #[test]
+    fn test_heartbeats_preserve_payload_time_and_resend_cadence() {
+        let start = Instant::now();
+        let period = Duration::from_secs(1);
+        let book = L2Book::from_l2_snapshot("#7510".to_string(), [vec![], vec![]], 123, None, None, None);
+        let bbo = Bbo { coin: "#7510".to_string(), time: 456, bid: None, ask: None };
+        let mut l2_sent = start;
+        let mut bbo_sent = start;
+        for second in 1..=3 {
+            let due = start + period * second;
+            assert!(heartbeat_payload(&mut l2_sent, Some(&book), due - Duration::from_millis(1), period).is_none());
+            assert!(heartbeat_payload(&mut bbo_sent, Some(&bbo), due - Duration::from_millis(1), period).is_none());
+            let l2_frame = heartbeat_payload(&mut l2_sent, Some(&book), due, period).unwrap();
+            let bbo_frame = heartbeat_payload(&mut bbo_sent, Some(&bbo), due, period).unwrap();
+            assert_eq!(serde_json::to_value(l2_frame).unwrap(), serde_json::to_value(&book).unwrap());
+            assert_eq!(serde_json::to_value(bbo_frame).unwrap(), serde_json::to_value(&bbo).unwrap());
+        }
+        let updated = Bbo { time: 789, ..bbo };
+        bbo_sent = start + period * 3;
+        assert_eq!(heartbeat_payload(&mut bbo_sent, Some(&updated), start + period * 4, period).unwrap().time, 789);
     }
 
     #[test]

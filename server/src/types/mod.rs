@@ -87,9 +87,6 @@ impl L2Book {
         Self { coin, time, n_sig_figs, mantissa, n_levels, levels: snapshot }
     }
 
-    pub(crate) const fn set_time(&mut self, time: u64) {
-        self.time = time;
-    }
 }
 
 impl Trade {

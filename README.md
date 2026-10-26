@@ -126,7 +126,7 @@ The `--snapshot-mode` flag controls *how* the server invokes `hl-node`:
 
 After the initial snapshot, the server stays up to date by watching the node's `*_streaming/` directories for real-time order diffs, fills, and status updates via inotify.
 
-The handoff from snapshot to live stream is **gapless**: at startup the server backfills the streaming files from the node's last persisted height, and every event that arrives while the snapshot is being generated is cached and replayed on top of it (filtered by block height, so nothing is double-applied). If the server ever detects that events were provably lost (a corrupt line, an oversized batch, watcher data loss), it marks the book out-of-sync and automatically re-fetches a snapshot in the background while continuing to serve — see `orderbook_desyncs_total` in the metrics.
+The handoff from snapshot to live stream is **gapless**: at startup the server backfills the streaming files from the exact periodic ABCI snapshot height, and every event that arrives while the snapshot is being generated is cached and replayed on top of it (filtered by block height, so nothing is double-applied). If the server ever detects that events were provably lost (a corrupt line, an oversized batch, watcher data loss), it marks the book out-of-sync and automatically re-fetches a snapshot in the background while continuing to serve — see `orderbook_desyncs_total` in the metrics.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -134,9 +134,9 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `--docker-container` | `hyperliquid_hlnode` | Container name for `docker exec` (docker mode only) |
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
-| `--abci-state-path` | auto | Path to `abci_state.rmp`. Auto-detected at `<data-dir>/../hyperliquid_data/abci_state.rmp` in direct mode (a sibling of `--data-dir`, alongside `visor_abci_state.json`). Override if your node stores state in a non-standard location |
+| `--abci-state-path` | latest periodic | Highest numeric `<data-dir>/periodic_abci_states/*/*.rmp`, or an explicit height-named `.rmp`. Live `abci_state.rmp` is rejected because its exact height is not encoded |
 | `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json`. Override if `/tmp` is not writable or you want snapshots stored elsewhere |
-| `--visor-state-path` | auto | Path to `visor_abci_state.json`, which contains the current block height. Auto-detected at `<data-dir>/../hyperliquid_data/visor_abci_state.json` (the *parent* of `--data-dir`, since `hyperliquid_data/` is a sibling of the `data/` event dir). Override if your visor state is in a non-standard location |
+| `--visor-state-path` | unused | Compatibility option. Snapshot height comes from the frozen periodic snapshot filename, not live visor state |
 
 ### Market Types
 
@@ -145,6 +145,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `perps` | Perpetual futures only (BTC, ETH, SOL...) |
 | `spot` | Spot markets (`@*` coins, PURR/USDC) |
 | `hip3` | HIP-3 markets (X:Y format, e.g., xyz:TSLA) |
+| `hip4` | HIP-4 Outcome markets, coin names starting with `#` |
 | `all` | All markets (default) |
 
 ### Advanced Options
@@ -176,7 +177,7 @@ By default, `l2Book` and `bbo` channels are **change-only**: a snapshot is only 
 The `--l2book-heartbeat-ms` and `--bbo-heartbeat-ms` flags add an opt-in periodic resend:
 
 - When set to `0` (default), the original change-only behavior is preserved. No new messages compared to previous versions.
-- When set to e.g. `1000`, every active subscription receives a cached payload at most every 1000 ms even if nothing changed. The `time` field is refreshed to the current server time on every heartbeat so clients can distinguish "fresh-but-unchanged" from "stale".
+- When set to e.g. `1000`, every active subscription receives a cached payload at most every 1000 ms even if nothing changed. The payload, including `time`, stays unchanged. `time` is the block time of the last real book update represented by that payload. Heartbeat arrival proves socket liveness, not fresh market data. A stalled node cannot outrank an independent feed by restamping stale content with server wall time. There is no restamp option in this fork.
 
 Each subscription tracks its own `last_sent` timestamp, so a real change resets the heartbeat — you never get a real update and a heartbeat back-to-back. Per-subscription accounting also means many quiet coins do not produce a synchronized burst.
 
@@ -390,7 +391,7 @@ The Hyperliquid node must run with **all** of these flags enabled:
 
 The in-memory book is kept consistent with the node through three layers:
 
-1. **Startup backfill** - at boot, the watchers read the streaming files from the node's last persisted height (not from end-of-file), so data written before the server started is not skipped.
+1. **Startup backfill** - at boot, the watchers read the streaming files from the exact periodic ABCI snapshot height (not from end-of-file), so data written before the server started is not skipped.
 2. **Snapshot replay** - every book-affecting event that arrives while a snapshot is being generated is cached and replayed above the snapshot height, making the snapshot-to-stream handoff gapless.
 3. **Desync self-healing** - any provable event loss (parse/apply error on a batch, oversized batch, watcher buffer discard, pending-cache eviction) marks the book out-of-sync and triggers an automatic background snapshot re-fetch. The book keeps serving its current state until the fresh snapshot lands. Each loss is recorded with a block-height bound, and the out-of-sync flag only clears once a snapshot's height actually covers that bound - a snapshot generated from lagging node state cannot mask a newer loss. Each occurrence is counted in `orderbook_desyncs_total{reason}`. The status/diff pairing caches are evicted by age (60 s): expected orphans are dropped silently, while an unpaired diff aging out counts as data loss and re-syncs the book.
 4. **Watcher watchdog** - if a file watcher thread dies (or every watcher channel closes), the server exits so the process supervisor restarts it into a clean re-sync, instead of serving a silently frozen book that still reports `ready`. A watcher that is alive but has produced no events for 2 minutes is loud-logged (restarting would not fix a stalled node).
@@ -685,3 +686,22 @@ Reach out to us at [hyperpc.app](https://hyperpc.app) to discuss what you need.
 ## License
 
 MIT
+
+### HIP-4 fork provenance
+
+`hip4-on-5710c9d` ports the local 2026-07-07 HIP-4 fix from `47ce696`
+onto imperator `5710c9d`. `--markets hip4` filters snapshots, trigger tables,
+backfill/replay caches, live events, and subscription validation to `#` coins.
+Perps exclude HIP-4. L2 and BBO include complementary sibling liquidity at
+`1 - price` on the opposite side; L4 and raw events remain native.
+
+The port retains the exact frozen snapshot height and the startup backfill
+barrier, bounded pairing of interleaved fills, pending size updates, remove
+tombstones, and crossed-book detection from the original patch. Unknown
+updates/removes alone are nonfatal. It retains upstream phased installs,
+streaming snapshot parsing, trigger orders, per-connection writers, bounded
+catch-up reads, replay-cache knobs, resync damping, and lock-free health.
+HIP-4 grouping merges full sibling depth before truncating coarse buckets.
+
+A real node restart has not yet verified resync in this release. Do not infer
+that guarantee from unit tests or a successful initial snapshot.
