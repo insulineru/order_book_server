@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::L2Snapshots,
     order_book::{
-        Coin, InnerOrder, Oid, PxBand, Snapshot,
+        Coin, InnerOrder, MarketFilter, Oid, PxBand, Snapshot,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -15,11 +15,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) struct DiffApplyOutcome {
+    pub(super) changed_coins: HashSet<Coin>,
+    pub(super) data_loss: bool,
+}
+
 pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
     height: u64,
     time: u64,
-    ignore_spot: bool,
+    market_filter: MarketFilter,
     // Persistent cache of OrderStatuses waiting for their New diffs
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible).
     // Entries carry their insertion time so cleanup can evict by age instead of
@@ -48,6 +53,10 @@ pub(super) struct OrderBookState {
     // lightweight memory envelope holds (the endpoint has no consumers in a
     // BBO-only deployment anyway).
     track_untriggered: bool,
+    // Remove can race ahead of the status/New pair across the independent
+    // watcher streams and replay cache. Tombstone such oids so a late open
+    // status cannot resurrect an already-cancelled order.
+    removed_before_add: HashMap<Oid, Instant>,
 }
 
 impl OrderBookState {
@@ -57,7 +66,7 @@ impl OrderBookState {
         height: u64,
         time: u64,
         ignore_triggers: bool,
-        ignore_spot: bool,
+        market_filter: MarketFilter,
         track_untriggered: bool,
     ) -> Self {
         // Seed the side table from the dump's untriggered_orders section
@@ -70,7 +79,7 @@ impl OrderBookState {
         > = rustc_hash::FxHashMap::default();
         if track_untriggered {
             for order in untriggered {
-                if ignore_spot && order.coin.is_spot() {
+                if !market_filter.matches(&order.coin) {
                     continue;
                 }
                 let oid = order.oid();
@@ -79,7 +88,7 @@ impl OrderBookState {
         }
         if ignore_triggers && track_untriggered {
             for order in snapshot.extract_triggers() {
-                if ignore_spot && order.coin.is_spot() {
+                if !market_filter.matches(&order.coin) {
                     continue;
                 }
                 let oid = order.oid();
@@ -96,7 +105,7 @@ impl OrderBookState {
             }
         }
         Self {
-            ignore_spot,
+            market_filter,
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
@@ -105,6 +114,7 @@ impl OrderBookState {
             insert_before_fallbacks: 0,
             untriggered_orders,
             track_untriggered,
+            removed_before_add: HashMap::new(),
         }
     }
 
@@ -131,12 +141,16 @@ impl OrderBookState {
         self.height
     }
 
-    pub(super) const fn ignore_spot(&self) -> bool {
-        self.ignore_spot
+    pub(super) const fn market_filter(&self) -> MarketFilter {
+        self.market_filter
     }
 
     pub(super) const fn time(&self) -> u64 {
         self.time
+    }
+
+    fn coin_allowed(&self, coin: &Coin) -> bool {
+        self.market_filter.matches(coin)
     }
 
     /// L4 snapshot of a single coin - (time, height, snapshot). Returns None when
@@ -158,7 +172,12 @@ impl OrderBookState {
         &self,
         changed_coins: &HashSet<Coin>,
         active: &HashSet<crate::listeners::order_book::L2SnapshotParams>,
-        cache: &mut HashMap<Coin, std::sync::Arc<HashMap<crate::listeners::order_book::L2SnapshotParams, Snapshot<crate::types::inner::InnerLevel>>>>,
+        cache: &mut HashMap<
+            Coin,
+            std::sync::Arc<
+                HashMap<crate::listeners::order_book::L2SnapshotParams, Snapshot<crate::types::inner::InnerLevel>>,
+            >,
+        >,
     ) -> (u64, L2Snapshots, HashSet<Coin>, bool) {
         let (snapshots, recomputed, coin_set_changed) =
             crate::listeners::order_book::utils::compute_l2_snapshots_incremental(
@@ -171,7 +190,13 @@ impl OrderBookState {
     }
 
     pub(super) fn compute_universe(&self) -> HashSet<Coin> {
-        self.order_book.as_ref().keys().cloned().collect()
+        let mut coins: HashSet<Coin> = self.order_book.as_ref().keys().cloned().collect();
+        for coin in self.order_book.as_ref().keys() {
+            if let Some(sibling) = coin.hip4_sibling() {
+                coins.insert(sibling);
+            }
+        }
+        coins
     }
 
     /// Count of OrderStatuses waiting for their OrderDiff::New to arrive
@@ -278,6 +303,8 @@ impl OrderBookState {
             cleared = true;
         }
 
+        self.removed_before_add.retain(|_, at| at.elapsed() < PENDING_MAX_AGE);
+
         if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
             log::warn!(
                 "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
@@ -336,6 +363,13 @@ impl OrderBookState {
 
         for order_status in batch.events() {
             let oid = Oid::new(order_status.order.oid);
+            let order_coin = Coin::new(&order_status.order.coin);
+            if !self.coin_allowed(&order_coin) {
+                continue;
+            }
+            if self.removed_before_add.contains_key(&oid) {
+                continue;
+            }
 
             // Maintain the untriggered-orders side table. "open" + is_trigger is a
             // pending trigger order (never rests on the book); any other status is
@@ -346,7 +380,7 @@ impl OrderBookState {
             if !self.track_untriggered {
                 // gated off (--bbo-only): the map stays empty
             } else if order_status.status == "open" {
-                if order_status.order.is_trigger && !(self.ignore_spot && Coin::str_is_spot(&order_status.order.coin)) {
+                if order_status.order.is_trigger && self.market_filter.matches(&Coin::new(&order_status.order.coin)) {
                     match InnerL4Order::try_from((order_status.user, order_status.order.clone())) {
                         Ok(inner) => {
                             self.untriggered_orders
@@ -381,7 +415,6 @@ impl OrderBookState {
             if let Some((sz, insert_before, _)) = self.pending_new_diffs.remove(&oid) {
                 // Both arrived - add order immediately!
                 let time = order_status.time.and_utc().timestamp_millis();
-                let order_coin = Coin::new(&order_status.order.coin);
                 let mut inner_order: InnerL4Order = order_status.try_into()?;
                 inner_order.modify_sz(sz);
                 inner_order.convert_trigger(time.max(0) as u64);
@@ -428,10 +461,11 @@ impl OrderBookState {
     /// HFT-specific: Process OrderDiffs independently without block synchronization
     /// Uses bidirectional caching - if status already arrived, add order immediately
     /// Returns the set of coins that were modified (for selective BBO broadcast)
-    pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
+    pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<DiffApplyOutcome> {
         let height = batch.block_number();
         let time = batch.block_time();
         let mut changed_coins = HashSet::new();
+        let mut data_loss = false;
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {
@@ -442,12 +476,15 @@ impl OrderBookState {
         for diff in batch.events() {
             let oid = diff.oid();
             let coin = diff.coin();
-            if coin.is_spot() && self.ignore_spot {
+            if !self.coin_allowed(&coin) {
                 continue;
             }
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz, insert_before } => {
+                    if self.removed_before_add.contains_key(&oid) {
+                        continue;
+                    }
                     // Check if OrderStatus already arrived
                     if let Some((order, _)) = self.pending_order_statuses.remove(&oid) {
                         // Both arrived - add order immediately!
@@ -472,16 +509,35 @@ impl OrderBookState {
                     }
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    let _ = self.order_book.modify_sz(oid, coin.clone(), new_sz);
+                    if !self.order_book.modify_sz(oid.clone(), coin.clone(), new_sz) {
+                        if let Some((pending_sz, _, _)) = self.pending_new_diffs.get_mut(&oid) {
+                            *pending_sz = new_sz;
+                        } else {
+                            log::debug!("OrderDiff::Update for unknown oid={:?} coin={:?}", oid, coin);
+                        }
+                    }
                     changed_coins.insert(coin);
                 }
                 InnerOrderDiff::Remove => {
-                    let _ = self.order_book.cancel_order(oid.clone(), coin.clone());
+                    let removed_live = self.order_book.cancel_order(oid.clone(), coin.clone());
+                    let removed_pending_new = self.pending_new_diffs.remove(&oid).is_some();
+                    let removed_pending_status = self.pending_order_statuses.remove(&oid).is_some();
+                    if !removed_live {
+                        self.removed_before_add.insert(oid.clone(), Instant::now());
+                    }
+                    if !(removed_live || removed_pending_new || removed_pending_status) {
+                        log::debug!("OrderDiff::Remove for unknown oid={:?} coin={:?}", oid, coin);
+                    }
                     changed_coins.insert(coin);
                 }
             }
         }
-        Ok(changed_coins)
+        if let Some(coin) = self.order_book.first_crossed_coin() {
+            log::warn!("Crossed order book detected for coin={coin:?}; marking data loss");
+            data_loss = true;
+            changed_coins.insert(coin);
+        }
+        Ok(DiffApplyOutcome { changed_coins, data_loss })
     }
 }
 
@@ -489,14 +545,19 @@ impl OrderBookState {
 mod tests {
     use super::*;
     use crate::order_book::multi_book::Snapshots;
-    use crate::types::inner::InnerL4Order;
     use crate::types::{L4Order, OrderDiff};
     use alloy::primitives::Address;
     use chrono::NaiveDateTime;
+    use std::time::{Duration, Instant};
 
     fn empty_state() -> OrderBookState {
         let snapshots = Snapshots::new(HashMap::new());
-        OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, false, true)
+        OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, MarketFilter::all(), true)
+    }
+
+    fn hip4_only_state() -> OrderBookState {
+        let snapshots = Snapshots::new(HashMap::new());
+        OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, MarketFilter::new(false, false, false, true), true)
     }
 
     fn make_l4_order(coin: &str, oid: u64) -> L4Order {
@@ -539,7 +600,8 @@ mod tests {
             "px": "100.0",
             "coin": coin,
             "raw_book_diff": diff
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn make_status_batch(statuses: Vec<NodeDataOrderStatus>) -> Batch<NodeDataOrderStatus> {
@@ -548,7 +610,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 100,
             "events": statuses
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn make_diff_batch(diffs: Vec<NodeDataOrderDiff>) -> Batch<NodeDataOrderDiff> {
@@ -557,7 +620,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 100,
             "events": diffs
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     // ==================== Initialization Tests ====================
@@ -627,7 +691,7 @@ mod tests {
     #[test]
     fn test_from_snapshot_extracts_untriggered_triggers() {
         let snapshots = snapshot_with_triggers("BTC", &[1, 2], &[100, 101]);
-        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, false, true);
+        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, MarketFilter::all(), true);
         // Triggers are kept in the side table (deduped from the two per-side
         // copies), not dropped - and never enter the book.
         assert_eq!(state.untriggered_count(), 2);
@@ -643,7 +707,7 @@ mod tests {
     fn test_from_snapshot_ignore_triggers_false_keeps_old_semantics() {
         // Tests that opt out of trigger extraction must not populate the table.
         let snapshots = snapshot_with_triggers("BTC", &[1], &[]);
-        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, false, false, true);
+        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, false, MarketFilter::all(), true);
         assert_eq!(state.untriggered_count(), 0);
     }
 
@@ -712,7 +776,7 @@ mod tests {
         // Live path: spot trigger opens are not tracked under ignore_spot,
         // matching the diff path's spot filtering.
         let mut state =
-            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), Vec::new(), 0, 0, true, true, true);
+            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), Vec::new(), 0, 0, true, MarketFilter::new(true, false, true, true), true);
         state
             .apply_order_statuses_hft(make_status_batch(vec![
                 make_trigger_status("@1", 1, "open", "1.0"),
@@ -731,7 +795,7 @@ mod tests {
             0,
             0,
             true,
-            true,
+            MarketFilter::new(true, false, true, true),
             true,
         );
         assert_eq!(spot_state.untriggered_count(), 0);
@@ -742,7 +806,7 @@ mod tests {
         // The --include-trigger-orders dump path: untriggered orders arrive as a
         // flat list, not embedded in the book sides.
         let seed = vec![make_inner_order("BTC", 100, true), make_inner_order("ETH", 101, true)];
-        let state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), seed, 0, 0, true, false, true);
+        let state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), seed, 0, 0, true, MarketFilter::all(), true);
         assert_eq!(state.untriggered_count(), 2);
         assert_eq!(state.order_count(), 0);
         let (_, _, btc) = state.untriggered_snapshot(Some(&Coin::new("BTC")));
@@ -761,7 +825,7 @@ mod tests {
             0,
             0,
             true,
-            false,
+            MarketFilter::all(),
             false,
         );
         assert_eq!(state.untriggered_count(), 0);
@@ -808,7 +872,7 @@ mod tests {
         // 2. OrderDiff::New arrives → order added immediately
         let diff = make_order_diff("BTC", 42, OrderDiff::New { sz: "1.5".to_string(), insert_before: None });
         let batch = make_diff_batch(vec![diff]);
-        let changed = state.apply_order_diffs_hft(batch).unwrap();
+        let changed = state.apply_order_diffs_hft(batch).unwrap().changed_coins;
         assert!(changed.contains(&Coin::new("BTC")));
         assert_eq!(state.pending_order_statuses_count(), 0); // consumed
         assert_eq!(state.order_count(), 1);
@@ -892,7 +956,7 @@ mod tests {
         // 1. OrderDiff::New arrives first → size cached
         let diff = make_order_diff("ETH", 99, OrderDiff::New { sz: "2.0".to_string(), insert_before: None });
         let batch = make_diff_batch(vec![diff]);
-        let changed = state.apply_order_diffs_hft(batch).unwrap();
+        let changed = state.apply_order_diffs_hft(batch).unwrap().changed_coins;
         assert!(changed.is_empty()); // not added yet
         assert_eq!(state.pending_new_diffs_count(), 1);
         assert!(state.pending_new_diffs_has(&Oid::new(99)));
@@ -919,8 +983,9 @@ mod tests {
         assert_eq!(state.order_count(), 1);
 
         // Now send Update
-        let update = make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.0".to_string() });
-        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
+        let update =
+            make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.0".to_string() });
+        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap().changed_coins;
         assert!(changed.contains(&Coin::new("BTC")));
     }
 
@@ -935,9 +1000,66 @@ mod tests {
 
         // Remove
         let remove = make_order_diff("BTC", 1, OrderDiff::Remove);
-        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap().changed_coins;
         assert!(changed.contains(&Coin::new("BTC")));
         assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_unknown_remove_is_nonfatal() {
+        let mut state = empty_state();
+        let remove = make_order_diff("BTC", 999, OrderDiff::Remove);
+        let outcome = state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+        assert!(!outcome.data_loss, "unknown oid remove is common for already-absent orders");
+        assert!(outcome.changed_coins.contains(&Coin::new("BTC")));
+    }
+
+    #[test]
+    fn test_remove_before_late_status_does_not_resurrect_order() {
+        let mut state = empty_state();
+        let new = make_order_diff("BTC", 7, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 1);
+
+        let remove = make_order_diff("BTC", 7, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+        assert_eq!(state.pending_new_diffs_count(), 0, "remove must clear a pending New half");
+
+        let status = make_order_status("BTC", 7, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        assert_eq!(state.order_count(), 0, "late open status must not resurrect a removed oid");
+        assert_eq!(state.pending_order_statuses_count(), 0);
+    }
+
+    #[test]
+    fn test_remove_before_new_tombstones_late_halves() {
+        let mut state = empty_state();
+        let remove = make_order_diff("BTC", 8, OrderDiff::Remove);
+        state.apply_order_diffs_hft(make_diff_batch(vec![remove])).unwrap();
+
+        let status = make_order_status("BTC", 8, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let new = make_order_diff("BTC", 8, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+
+        assert_eq!(state.order_count(), 0);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+    }
+
+    #[test]
+    fn test_update_before_status_updates_pending_new_size() {
+        let mut state = empty_state();
+        let new = make_order_diff("BTC", 9, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        state.apply_order_diffs_hft(make_diff_batch(vec![new])).unwrap();
+        let update =
+            make_order_diff("BTC", 9, OrderDiff::Update { orig_sz: "1.0".to_string(), new_sz: "3.0".to_string() });
+        state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
+
+        let status = make_order_status("BTC", 9, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let (_time, _height, snapshot) = state.compute_snapshot_for_coin(&Coin::new("BTC"), PxBand::default()).unwrap();
+        assert_eq!(snapshot.as_ref()[0][0].sz(), crate::order_book::Sz::new(300_000_000));
     }
 
     // ==================== Status Filtering ====================
@@ -960,15 +1082,43 @@ mod tests {
         assert_eq!(state.pending_order_statuses_count(), 0);
     }
 
+    #[test]
+    fn test_hip4_only_filter_skips_non_hip4_statuses_and_diffs() {
+        let mut state = hip4_only_state();
+        let status = make_order_status("BTC", 42, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff("BTC", 42, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        let outcome = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        assert!(outcome.changed_coins.is_empty());
+        assert!(!outcome.data_loss);
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.order_count(), 0);
+    }
+
+    #[test]
+    fn test_hip4_only_filter_keeps_hip4_orders() {
+        let mut state = hip4_only_state();
+        let status = make_order_status("#7370", 42, "open");
+        state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
+        let diff = make_order_diff("#7370", 42, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
+        let outcome = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+
+        assert!(outcome.changed_coins.contains(&Coin::new("#7370")));
+        assert!(!outcome.data_loss);
+        assert_eq!(state.order_count(), 1);
+    }
+
     // ==================== Spot Filtering ====================
 
     #[test]
     fn test_spot_filtered_when_ignore_spot() {
         let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, true, true); // ignore_spot=true
+        let mut state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, MarketFilter::new(true, false, true, true), true); // ignore_spot=true
 
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
-        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
+        let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap().changed_coins;
         assert!(changed.is_empty());
         assert_eq!(state.pending_new_diffs_count(), 0); // skipped entirely
     }
@@ -991,7 +1141,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 500,
             "events": []
-        })).unwrap();
+        }))
+        .unwrap();
         state.apply_order_diffs_hft(batch).unwrap();
         assert_eq!(state.height(), 500);
     }
@@ -1005,7 +1156,8 @@ mod tests {
             "block_time": "2024-01-15T10:31:00.000000000",
             "block_number": 500,
             "events": []
-        })).unwrap();
+        }))
+        .unwrap();
         state.apply_order_diffs_hft(batch).unwrap();
 
         // Try to go to 200
@@ -1014,7 +1166,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 200,
             "events": []
-        })).unwrap();
+        }))
+        .unwrap();
         state.apply_order_diffs_hft(batch).unwrap();
         assert_eq!(state.height(), 500); // unchanged
     }
@@ -1028,7 +1181,7 @@ mod tests {
             let status = make_order_status("BTC", i, "open");
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();
         }
-        state.age_pending_entries(std::time::Duration::from_secs(61));
+        state.age_pending_entries(Duration::from_secs(61));
         // Aged statuses are expected orphans (order never rested) - NOT data loss.
         assert!(!state.cleanup_stale_pending(), "aged status eviction must not force a re-sync");
         assert_eq!(state.pending_order_statuses_count(), 0);
@@ -1041,7 +1194,7 @@ mod tests {
             let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
-        state.age_pending_entries(std::time::Duration::from_secs(61));
+        state.age_pending_entries(Duration::from_secs(61));
         // A New diff whose status never arrived means the book is missing an order.
         assert!(state.cleanup_stale_pending(), "aged diff eviction is data loss and must trigger a re-sync");
         assert_eq!(state.pending_new_diffs_count(), 0);
@@ -1138,7 +1291,7 @@ mod tests {
         }
 
         // Time matching diffs arrival
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for i in 0..1000u64 {
             let diff = make_order_diff("BTC", i, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
@@ -1163,7 +1316,7 @@ mod tests {
             state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for i in 0..1000u64 {
             let status = make_order_status("BTC", i, "open");
             state.apply_order_statuses_hft(make_status_batch(vec![status])).unwrap();

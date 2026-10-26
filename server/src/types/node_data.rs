@@ -119,6 +119,10 @@ impl<E> Batch<E> {
         self.events.len()
     }
 
+    pub(crate) fn filter_events(mut self, mut keep: impl FnMut(&E) -> bool) -> Self {
+        self.events.retain(|event| keep(event));
+        self
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +152,13 @@ mod tests {
         }
     }
 
-    fn make_order_status(status: &str, is_trigger: bool, tif: Option<&str>, coin: &str, oid: u64) -> NodeDataOrderStatus {
+    fn make_order_status(
+        status: &str,
+        is_trigger: bool,
+        tif: Option<&str>,
+        coin: &str,
+        oid: u64,
+    ) -> NodeDataOrderStatus {
         let mut order = make_l4_order(coin, oid);
         order.is_trigger = is_trigger;
         order.tif = tif.map(String::from);
@@ -225,8 +235,14 @@ mod tests {
     fn test_event_source_streaming_dirs() {
         let dir = std::path::Path::new("/data");
         assert_eq!(EventSource::Fills.event_source_dir_streaming(dir), PathBuf::from("/data/node_fills_streaming"));
-        assert_eq!(EventSource::OrderStatuses.event_source_dir_streaming(dir), PathBuf::from("/data/node_order_statuses_streaming"));
-        assert_eq!(EventSource::OrderDiffs.event_source_dir_streaming(dir), PathBuf::from("/data/node_raw_book_diffs_streaming"));
+        assert_eq!(
+            EventSource::OrderStatuses.event_source_dir_streaming(dir),
+            PathBuf::from("/data/node_order_statuses_streaming")
+        );
+        assert_eq!(
+            EventSource::OrderDiffs.event_source_dir_streaming(dir),
+            PathBuf::from("/data/node_raw_book_diffs_streaming")
+        );
     }
 
     // ==================== NodeDataOrderDiff Tests ====================

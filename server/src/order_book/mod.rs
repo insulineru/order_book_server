@@ -9,7 +9,7 @@ pub(crate) mod multi_book;
 mod price_level;
 pub(crate) mod types;
 
-pub(crate) use types::{Coin, InnerOrder, Oid, Px, PxBand, Side, Sz};
+pub(crate) use types::{Coin, InnerOrder, MarketFilter, Oid, Px, PxBand, Side, Sz};
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
@@ -24,9 +24,10 @@ pub(crate) struct OrderBook<O> {
 pub(crate) struct Snapshot<O>([Vec<O>; 2]);
 
 impl<O: Clone> Snapshot<O> {
-    /// Production paths consume snapshots via `into_inner` (no re-clone);
-    /// tests borrow them for assertions.
-    #[cfg(test)]
+    pub(crate) const fn new(value: [Vec<O>; 2]) -> Self {
+        Self(value)
+    }
+
     pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
         &self.0
     }
@@ -94,6 +95,13 @@ impl<O: InnerOrder> OrderBook<O> {
     /// Number of orders in this orderbook
     pub(crate) fn order_count(&self) -> usize {
         self.oid_to_side_px.len()
+    }
+
+    pub(crate) fn is_crossed(&self) -> bool {
+        match (self.bids.last_key_value(), self.asks.first_key_value()) {
+            (Some((bid, _)), Some((ask, _))) => bid >= ask,
+            _ => false,
+        }
     }
 
     pub(crate) fn add_order(&mut self, order: O) {
@@ -1106,9 +1114,6 @@ mod tests {
         let elapsed = start.elapsed();
         let per_call = elapsed / iterations;
 
-        eprintln!(
-            "[PERF] L4 from_snapshot (1000 orders): {iterations} calls in {:?} ({:?}/call)",
-            elapsed, per_call
-        );
+        eprintln!("[PERF] L4 from_snapshot (1000 orders): {iterations} calls in {:?} ({:?}/call)", elapsed, per_call);
     }
 }

@@ -42,11 +42,16 @@ impl Sz {
 }
 
 impl Px {
+    const ONE_VALUE: u64 = 100_000_000;
+
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
     pub(crate) const fn value(self) -> u64 {
         self.0
+    }
+    pub(crate) const fn one_minus(self) -> Option<Self> {
+        if self.0 <= Self::ONE_VALUE { Some(Self(Self::ONE_VALUE - self.0)) } else { None }
     }
 }
 
@@ -94,9 +99,25 @@ impl Coin {
         self.0.contains(':')
     }
 
-    /// Returns true for perpetual futures (not spot, not hip3)
+    /// Returns true for HIP-4 Outcome markets (`#<outcome><side>` coins).
+    pub(crate) fn is_hip4(&self) -> bool {
+        self.0.starts_with('#')
+    }
+
+    pub(crate) fn hip4_outcome_side(&self) -> Option<(u64, u8)> {
+        let encoded = self.0.strip_prefix('#')?.parse::<u64>().ok()?;
+        let side = encoded % 10;
+        if side <= 1 { Some((encoded / 10, side as u8)) } else { None }
+    }
+
+    pub(crate) fn hip4_sibling(&self) -> Option<Self> {
+        let (outcome, side) = self.hip4_outcome_side()?;
+        Some(Self(format!("#{}", outcome * 10 + u64::from(1 - side))))
+    }
+
+    /// Returns true for perpetual futures (not spot, hip3, or hip4)
     pub(crate) fn is_perp(&self) -> bool {
-        !self.is_spot() && !self.is_hip3()
+        !self.is_spot() && !self.is_hip3() && !self.is_hip4()
     }
 }
 
@@ -107,6 +128,32 @@ impl Coin {
 impl std::borrow::Borrow<str> for Coin {
     fn borrow(&self) -> &str {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarketFilter {
+    include_perps: bool,
+    include_spot: bool,
+    include_hip3: bool,
+    include_hip4: bool,
+}
+
+impl MarketFilter {
+    pub(crate) const fn new(include_perps: bool, include_spot: bool, include_hip3: bool, include_hip4: bool) -> Self {
+        Self { include_perps, include_spot, include_hip3, include_hip4 }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn all() -> Self {
+        Self::new(true, true, true, true)
+    }
+
+    pub(crate) fn matches(self, coin: &Coin) -> bool {
+        (coin.is_perp() && self.include_perps)
+            || (coin.is_spot() && self.include_spot)
+            || (coin.is_hip3() && self.include_hip3)
+            || (coin.is_hip4() && self.include_hip4)
     }
 }
 
@@ -426,6 +473,7 @@ mod tests {
         assert!(c.is_perp());
         assert!(!c.is_spot());
         assert!(!c.is_hip3());
+        assert!(!c.is_hip4());
     }
 
     #[test]
@@ -449,6 +497,16 @@ mod tests {
         assert!(c.is_hip3());
         assert!(!c.is_perp());
         assert!(!c.is_spot());
+        assert!(!c.is_hip4());
+    }
+
+    #[test]
+    fn test_coin_hip4() {
+        let c = Coin::new("#7370");
+        assert!(c.is_hip4());
+        assert!(!c.is_perp());
+        assert!(!c.is_spot());
+        assert!(!c.is_hip3());
     }
 
     #[test]

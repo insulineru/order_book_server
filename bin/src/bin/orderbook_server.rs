@@ -19,7 +19,9 @@ pub enum Markets {
     Spot,
     /// HIP-3 markets only
     Hip3,
-    /// All markets (perps + spot + hip3)
+    /// HIP-4 Outcome markets only (# coins)
+    Hip4,
+    /// All markets (perps + spot + hip3 + hip4)
     #[default]
     All,
 }
@@ -48,7 +50,7 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Which markets to include: perps, spot, hip3, all
+    /// Which markets to include: perps, spot, hip3, hip4, all
     #[arg(long, value_enum, default_value = "all")]
     markets: Markets,
 
@@ -68,9 +70,9 @@ struct Args {
     #[arg(long, default_value = "hl-node")]
     hlnode_binary: String,
 
-    /// Path to abci_state.rmp file (only used in direct mode).
-    /// Default: <data_dir>/../hyperliquid_data/abci_state.rmp
-    /// (sibling of --data-dir, alongside visor_abci_state.json)
+    /// Path to a height-named periodic ABCI snapshot.
+    /// Default: highest <data_dir>/periodic_abci_states/*/*.rmp
+    /// Live abci_state.rmp is rejected because its height is not encoded.
     #[arg(long)]
     abci_state_path: Option<PathBuf>,
 
@@ -79,8 +81,7 @@ struct Args {
     #[arg(long)]
     snapshot_output_path: Option<PathBuf>,
 
-    /// Path to visor_abci_state.json (optional, for height info).
-    /// Default: <data_dir>/.hyperliquid_rpc_hlnode_mainnet/volumes/hl/hyperliquid_data/visor_abci_state.json
+    /// Deprecated/diagnostic only. Snapshot height is not read from live visor state.
     #[arg(long)]
     visor_state_path: Option<PathBuf>,
 
@@ -161,11 +162,12 @@ async fn main() -> Result<()> {
     let full_address = format!("{}:{}", args.address, args.port);
 
     // Determine market flags from Markets enum
-    let (include_perps, include_spot, include_hip3) = match args.markets {
-        Markets::Perps => (true, false, false),
-        Markets::Spot => (false, true, false),
-        Markets::Hip3 => (false, false, true),
-        Markets::All => (true, true, true),
+    let (include_perps, include_spot, include_hip3, include_hip4) = match args.markets {
+        Markets::Perps => (true, false, false, false),
+        Markets::Spot => (false, true, false, false),
+        Markets::Hip3 => (false, false, true, false),
+        Markets::Hip4 => (false, false, false, true),
+        Markets::All => (true, true, true, true),
     };
 
     // Build config
@@ -176,6 +178,7 @@ async fn main() -> Result<()> {
         include_perps,
         include_spot,
         include_hip3,
+        include_hip4,
         snapshot_mode: args.snapshot_mode,
         docker_container: args.docker_container,
         hlnode_binary: args.hlnode_binary,

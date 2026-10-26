@@ -29,6 +29,10 @@ pub(crate) enum FileEvent {
     /// would corrupt the book.
     BackfillOrderStatus(String),
     BackfillOrderDiff(String),
+    /// Startup backfill for this source has been fully sent into the channel.
+    /// The listener waits for the book-mutating sources before starting its
+    /// initial snapshot so those lines are in the replay cache first.
+    BackfillComplete(EventSource),
     /// The watcher had to discard buffered data (oversized partial line). The
     /// book may have missed events and must be re-synced from a snapshot.
     Desync(EventSource),
@@ -561,6 +565,10 @@ pub(super) fn spawn_file_watcher(
                 error!("{source_name} channel closed, exiting");
                 return;
             }
+            if tx.blocking_send(FileEvent::BackfillComplete(source)).is_err() {
+                error!("{source_name} channel closed, exiting");
+                return;
+            }
         }
 
         // HFT CRITICAL: Use fast polling (1ms) for lowest latency
@@ -908,7 +916,10 @@ mod tests {
 
     #[test]
     fn test_extract_block_number() {
-        assert_eq!(extract_block_number(r#"{"local_time":"t","block_time":"t","block_number":123,"events":[]}"#), Some(123));
+        assert_eq!(
+            extract_block_number(r#"{"local_time":"t","block_time":"t","block_number":123,"events":[]}"#),
+            Some(123)
+        );
         assert_eq!(extract_block_number(r#"{"block_number": 7}"#), Some(7), "whitespace after the colon is fine");
         assert_eq!(extract_block_number(r#"{"height":9}"#), None);
         assert_eq!(extract_block_number(r#"{"block_number":"x"}"#), None);
